@@ -141,7 +141,7 @@ const LiveBidding = () => {
   useEffect(() => {
     const socket = getSocket();
     
-    socket.on("newBid", (data) => {
+    socket.on("auction:bid", (data) => {
       const { auctionId, amount, bidder, timestamp } = data;
       
       // Update live data for the auction
@@ -201,21 +201,21 @@ const LiveBidding = () => {
       }
     });
 
-    socket.on("participantUpdate", (data) => {
-      const { auctionId, count } = data;
+    socket.on("auction:update", (data) => {
+      const { auctionId, participantCount } = data;
       
       setLiveData(prev => ({
         ...prev,
         [auctionId]: {
           ...prev[auctionId],
-          participants: count
+          participants: participantCount
         }
       }));
     });
 
     return () => {
-      socket.off("newBid");
-      socket.off("participantUpdate");
+      socket.off("auction:bid");
+      socket.off("auction:update");
     };
   }, [products, toast]);
 

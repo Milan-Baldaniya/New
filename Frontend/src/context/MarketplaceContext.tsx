@@ -124,11 +124,11 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     };
     
     // Add socket event listener
-    socket.on('newBid', handleBidUpdate);
+    socket.on('auction:bid', handleBidUpdate);
     
     // Clean up listener on unmount
     return () => {
-      socket.off('newBid', handleBidUpdate);
+      socket.off('auction:bid', handleBidUpdate);
     };
   }, []);
 

@@ -16,16 +16,9 @@ import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/components/ui/use-toast";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
-import { AlertCircle, ArrowLeft, Clock, Gavel, Users, UserCheck, Award, RefreshCw, Lock, AlertTriangle, Loader2 } from "lucide-react";
+import { AlertCircle, ArrowLeft, Clock, Gavel, Users, UserCheck, Award, RefreshCw, Lock, AlertTriangle } from "lucide-react";
 import { Product } from "@/services/productService";
-import { 
-  getSocket, 
-  getSocketUrl, 
-  createSocket, 
-  checkConnection, 
-  getAuctionState,
-  getLatestBid
-} from "@/lib/socket";
+import { getSocket, getSocketUrl, createSocket, checkConnection } from "@/lib/socket";
 
 const LiveBidding = () => {
   const { id } = useParams<{ id: string }>();
@@ -241,8 +234,13 @@ const LiveBidding = () => {
         const minimumNextBid = (productData.currentBid || productData.startingBid || 0) + 0.5;
         setBidAmount(minimumNextBid);
         
-        // Initialize bid history - REMOVED Mock data generation here
-        // We will let the socket fetch real data instead
+        // Initialize bid history
+        if (bidHistory.length === 0) {
+          // Either fetch actual bid history or generate mock data
+          const mockBidHistory = generateMockBidHistory(productData);
+          setBidHistory(mockBidHistory);
+          setParticipants(Math.floor(Math.random() * 10) + 3);
+        }
       } catch (error) {
         console.error("Error loading product:", error);
         
@@ -271,59 +269,7 @@ const LiveBidding = () => {
     };
   }, [id, fetchProductById, navigate, toast]);
   
-  // Function to fetch auction state with retry capability
-  const fetchAuctionState = useCallback(async () => {
-    if (!product?.id) return;
-    
-    console.log("LiveBidding: Fetching auction state from server with retry capability");
-    try {
-      const stateResponse = await getAuctionState(product.id);
-      console.log("LiveBidding: Received auction state:", stateResponse);
-      
-      if (stateResponse && stateResponse.success) {
-        // Update with the latest product state from the server
-        if (stateResponse.product) {
-          setProduct(stateResponse.product);
-          productRef.current = stateResponse.product;
-          
-          // Update bid amount based on current state
-          const minimumNextBid = (stateResponse.product.currentBid || stateResponse.product.startingBid || 0) + 0.5;
-          setBidAmount(minimumNextBid);
-        }
-        
-        // Always update bid history from server data
-        if (stateResponse.bidHistory) {
-          console.log("LiveBidding: Setting bid history from server:", stateResponse.bidHistory);
-          
-          // Process the incoming bid history to format timestamps consistently
-          const processedHistory = stateResponse.bidHistory.map(bid => ({
-            amount: bid.amount,
-            bidder: bid.bidder || 'Anonymous',
-            timestamp: new Date(bid.timestamp) // Convert string timestamps to Date objects
-          }));
-          
-          // Only update if we actually have bids to show
-          if (processedHistory.length > 0) {
-            setBidHistory(processedHistory);
-            console.log("LiveBidding: Updated bid history with", processedHistory.length, "items");
-          } else {
-            console.log("LiveBidding: No bid history items received from server");
-          }
-        } else {
-          console.log("LiveBidding: No bid history data in response");
-        }
-      }
-    } catch (error) {
-      console.error("LiveBidding: Error fetching auction state:", error);
-      toast({
-        title: "Sync Error",
-        description: "Unable to fetch latest auction data. Try refreshing the page.",
-        variant: "destructive",
-      });
-    }
-  }, [product?.id, toast]);
-  
-  // Update the socket connection setup to listen for state updates
+  // Set up socket connection for real-time updates
   useEffect(() => {
     if (!product) {
       console.log('LiveBidding: No product data, skipping socket setup');
@@ -334,82 +280,43 @@ const LiveBidding = () => {
     console.log('LiveBidding: Socket connected status:', getSocket().connected);
     console.log('LiveBidding: Socket ID:', getSocket().id);
     
-    // Ensure socket is created and connected
-    const socket = getSocket();
-    if (!socket.connected) {
-      console.log('LiveBidding: Socket not connected, attempting to connect');
-      socket.connect();
-    }
-    
     // Join the auction room
-    socket.emit("auction:join", product.id, (response) => {
+    getSocket().emit("auction:join", product.id, (response) => {
       console.log("Joined auction room:", response);
       // Update participant count on successful join
       if (response && response.success) {
         setParticipants(response.participantCount);
-        
-        // Always fetch current auction state after joining
-        fetchAuctionState();
-        
-        // Also request a state update broadcast to ensure everyone has the latest data
-        socket.emit("auction:requestStateUpdate", { auctionId: product.id }, (response) => {
-          console.log("Requested state update broadcast:", response);
-        });
       }
     });
     
     // Confirm connection status
-    console.log(`LiveBidding: Socket connected: ${socket.connected ? 'Yes' : 'No'}, ID: ${socket.id}`);
+    console.log(`LiveBidding: Socket connected: ${getSocket().connected ? 'Yes' : 'No'}, ID: ${getSocket().id}`);
     
     // Listen for new bids
     const handleNewBid = (data: any) => {
       console.log(`LiveBidding: Received new bid:`, data);
       if (!isMounted.current) return;
       
-      // Check if this bid is for our auction
-      if (data.auctionId !== product.id) {
-        console.log(`LiveBidding: Ignoring bid for different auction: ${data.auctionId}`);
-        return;
-      }
-      
       // Update product with new bid
       setProduct(prevProduct => {
         if (!prevProduct) return null;
         
-        // Also update the productRef to ensure timer calculations use latest data
-        const updatedProduct = {
+        return {
           ...prevProduct,
           currentBid: data.amount,
           bidder: data.bidder
         };
-        productRef.current = updatedProduct;
-        
-        return updatedProduct;
       });
       
-      // Update bid history - add to the existing history
-      const newBid = {
-        amount: data.amount,
-        bidder: typeof data.bidder === 'object' ? data.bidder.name : 'Anonymous',
-        timestamp: new Date(data.timestamp || Date.now())
-      };
-      
-      // Use function form to ensure we're always working with latest state
-      setBidHistory(prev => {
-        // Check if this bid is already in our history to avoid duplicates
-        const exists = prev.some(bid => 
-          bid.amount === newBid.amount && 
-          bid.bidder === newBid.bidder
-        );
-        
-        if (exists) {
-          console.log("LiveBidding: Bid already in history, not adding duplicate");
-          return prev;
-        }
-        
-        // Add to beginning of array
-        return [newBid, ...prev];
-      });
+      // Update bid history
+      setBidHistory(prev => [
+        {
+          amount: data.amount,
+          bidder: typeof data.bidder === 'object' ? data.bidder.name : 'Anonymous',
+          timestamp: new Date(data.timestamp)
+        },
+        ...prev
+      ]);
       
       // Update minimum bid amount
       setBidAmount(data.amount + 0.5);
@@ -421,51 +328,6 @@ const LiveBidding = () => {
       });
     };
     
-    // Listen for full state updates
-    const handleStateUpdate = (data: any) => {
-      console.log(`LiveBidding: Received state update:`, data);
-      if (!isMounted.current) return;
-      
-      // Check if this update is for our auction
-      if (data.auctionId !== product.id) {
-        console.log(`LiveBidding: Ignoring state update for different auction: ${data.auctionId}`);
-        return;
-      }
-      
-      // Update product data
-      if (data.product) {
-        setProduct(prevProduct => {
-          if (!prevProduct) return null;
-          
-          const updatedProduct = {
-            ...prevProduct,
-            ...data.product
-          };
-          productRef.current = updatedProduct;
-          
-          return updatedProduct;
-        });
-        
-        // Update bid amount
-        const minimumNextBid = (data.product.currentBid || data.product.startingBid || 0) + 0.5;
-        setBidAmount(minimumNextBid);
-      }
-      
-      // Update bid history
-      if (data.bidHistory && data.bidHistory.length > 0) {
-        console.log(`LiveBidding: Updating bid history with ${data.bidHistory.length} items from state update`);
-        
-        // Process the incoming bid history to format timestamps consistently
-        const processedHistory = data.bidHistory.map(bid => ({
-          amount: bid.amount,
-          bidder: bid.bidder || 'Anonymous',
-          timestamp: new Date(bid.timestamp) // Convert string timestamps to Date objects
-        }));
-        
-        setBidHistory(processedHistory);
-      }
-    };
-    
     // Listen for participant count updates
     const handleParticipantUpdate = (data: any) => {
       console.log(`LiveBidding: Participant update:`, data);
@@ -474,47 +336,19 @@ const LiveBidding = () => {
       }
     };
     
-    socket.on("auction:bid", handleNewBid);
-    socket.on("auction:update", handleParticipantUpdate);
-    socket.on("auction:stateUpdate", handleStateUpdate);
-    
-    // Add a periodic check for missed bids by fetching the full auction state
-    const bidCheckInterval = setInterval(() => {
-      if (isMounted.current && socket.connected) {
-        console.log('LiveBidding: Checking for auction updates');
-        fetchAuctionState();
-      }
-    }, 10000); // Check every 10 seconds
-    
-    // Add event listener for page visibility changes
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && isMounted.current) {
-        console.log('LiveBidding: Page became visible, refreshing auction state');
-        fetchAuctionState();
-        
-        // Also request a state update broadcast
-        socket.emit("auction:requestStateUpdate", { auctionId: product.id });
-      }
-    };
-    
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    
-    // Initial fetch of auction state
-    fetchAuctionState();
+    getSocket().on("auction:bid", handleNewBid);
+    getSocket().on("auction:update", handleParticipantUpdate);
     
     return () => {
       console.log('LiveBidding: Cleaning up socket connections');
       // Leave the auction room
-      socket.emit("auction:leave", product.id, (response) => {
+      getSocket().emit("auction:leave", product.id, (response) => {
         console.log("Left auction room:", response);
       });
-      socket.off("auction:bid", handleNewBid);
-      socket.off("auction:update", handleParticipantUpdate);
-      socket.off("auction:stateUpdate", handleStateUpdate);
-      clearInterval(bidCheckInterval);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      getSocket().off("auction:bid", handleNewBid);
+      getSocket().off("auction:update", handleParticipantUpdate);
     };
-  }, [product?.id, toast, fetchAuctionState]);
+  }, [product?.id]); // Only depend on product.id, not the entire product object
   
   // Update time left for auction - only set up once when product loads
   useEffect(() => {
@@ -594,59 +428,100 @@ const LiveBidding = () => {
     }
   }, [product?.endBidTime]);
   
-  // Add a manual reconnect function for socket connection issues
+  const handlePlaceBid = async () => {
+    if (!product || !bidAmount || !isAuthenticated || !user) return;
+    
+    // Check if bid is high enough
+    if (bidAmount <= (product.currentBid || product.startingBid || 0)) {
+      toast({
+        title: "Bid too low",
+        description: `Your bid must be higher than $${(product.currentBid || product.startingBid || 0).toFixed(2)}`,
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    setIsPlacingBid(true);
+    
+    try {
+      console.log('LiveBidding: Placing bid:', {
+        auctionId: product.id,
+        amount: bidAmount,
+        userId: user.id || user._id
+      });
+      
+      // Use socket for real-time bidding
+      getSocket().emit("auction:bid", {
+        auctionId: product.id,
+        amount: bidAmount,
+        userId: user.id || user._id
+      }, (response) => {
+        console.log("Bid response:", response);
+        
+        // Handle bid response
+        if (response && response.success) {
+          // Bid will be reflected via socket event
+          toast({
+            title: "Bid Placed!",
+            description: `You successfully bid $${bidAmount.toFixed(2)}`,
+          });
+        } else {
+          toast({
+            title: "Bid Failed",
+            description: response?.error || "Failed to place your bid. Please try again.",
+            variant: "destructive",
+          });
+        }
+        
+        setIsPlacingBid(false);
+      });
+    } catch (error) {
+      console.error("Error placing bid:", error);
+      
+      if (isMounted.current) {
+        toast({
+          title: "Bid Failed",
+          description: "Failed to place your bid. Please try again.",
+          variant: "destructive",
+        });
+        setIsPlacingBid(false);
+      }
+    }
+  };
+  
+  // Add a manual reconnect function
   const reconnectSocket = useCallback(() => {
     setReconnecting(true);
     setSocketError('Attempting to reconnect...');
     
-    console.log("[DEBUG] Starting socket reconnection process");
-    
     // Close and recreate socket
     const socket = getSocket();
     if (socket) {
-      console.log("[DEBUG] Closing existing socket connection");
       socket.close();
     }
     
-    console.log("[DEBUG] Creating new socket connection");
     createSocket();
     const newSocket = getSocket();
-    console.log("[DEBUG] New socket created, connected:", newSocket.connected);
     
     // Check if reconnection was successful
     if (newSocket && newSocket.connected) {
-      console.log("[DEBUG] Socket reconnected successfully");
       setSocketConnected(true);
       setSocketError(null);
       setReconnecting(false);
       
       // Rejoin auction room
       if (id) {
-        console.log("[DEBUG] Rejoining auction room:", id);
-        newSocket.emit("auction:join", id, (response) => {
-          console.log("[DEBUG] Rejoined auction room response:", response);
-        });
+        newSocket.emit("auction:join", id);
       }
     } else {
-      console.log("[DEBUG] Socket reconnection not immediately successful, scheduling check");
       // Schedule another check
       setTimeout(() => {
         if (isMounted.current) {
-          console.log("[DEBUG] Checking connection status after delay");
           const connected = checkConnection();
-          console.log("[DEBUG] Connection check result:", connected);
           setSocketConnected(connected);
           setReconnecting(false);
           if (connected) {
             setSocketError(null);
-            
-            // If reconnected, make sure we're in the auction room
-            if (id) {
-              console.log("[DEBUG] Rejoining auction room after delayed reconnect:", id);
-              getSocket().emit("auction:join", id, (response) => {
-                console.log("[DEBUG] Rejoined auction room response:", response);
-              });
-            }
           } else {
             setSocketError('Failed to reconnect. Please try again.');
           }
@@ -654,182 +529,6 @@ const LiveBidding = () => {
       }, 2000);
     }
   }, [id]);
-  
-  // Handle bid submission
-  const handleSubmit = async (event: React.FormEvent) => {
-    event.preventDefault();
-    
-    if (!product || !user || !bidAmount || isPlacingBid || isAuctionEnded) {
-      return;
-    }
-    
-    // Validate bid amount
-    const minBid = (product.currentBid || product.startingBid || 0) + 0.5;
-    if (bidAmount < minBid) {
-      toast({
-        title: "Invalid Bid",
-        description: `Your bid must be at least $${minBid.toFixed(2)}`,
-        variant: "destructive",
-      });
-      return;
-    }
-    
-    setIsPlacingBid(true);
-    console.log("[DEBUG] Placing bid:", bidAmount);
-    
-    try {
-      // First verify auction is still active
-      const socket = getSocket();
-      socket.emit("auction:status", { auctionId: product.id }, async (statusResponse: any) => {
-        if (!statusResponse?.success || statusResponse.isEnded) {
-          console.log("[DEBUG] Auction has ended, cannot place bid");
-          toast({
-            title: "Auction Ended",
-            description: "This auction has ended and no more bids can be placed.",
-            variant: "destructive",
-          });
-          setIsPlacingBid(false);
-          return;
-        }
-        
-        // Place the bid
-        const bidData = {
-          auctionId: product.id,
-          amount: bidAmount,
-          userId: user.id,
-          bidder: {
-            id: user.id,
-            name: user.name || user.username || 'Anonymous'
-          }
-        };
-        
-        console.log("[DEBUG] Sending bid data:", bidData);
-        
-        socket.emit("auction:bid", bidData, async (response: any) => {
-          if (!isMounted.current) return;
-          
-          if (response && response.success) {
-            console.log("[DEBUG] Bid placed successfully:", response);
-            
-            // Update product with new bid
-            setProduct(prev => {
-              if (!prev) return null;
-              
-              const updatedProduct = {
-                ...prev,
-                currentBid: bidAmount,
-                bidder: bidData.bidder
-              };
-              
-              productRef.current = updatedProduct;
-              return updatedProduct;
-            });
-            
-            // Prepare for next bid
-            setBidAmount(bidAmount + 0.5);
-            
-            // Show success message
-            toast({
-              title: "Bid Placed!",
-              description: `Your bid of $${bidAmount.toFixed(2)} was placed successfully.`,
-            });
-            
-            // Manually update bid history to ensure it appears immediately
-            const newBidEntry = {
-              amount: bidAmount,
-              bidder: user.name || user.username || 'Anonymous',
-              timestamp: new Date()
-            };
-            
-            console.log("[DEBUG] Adding new bid to history:", newBidEntry);
-            
-            setBidHistory(prev => {
-              // Check if this bid is already in our history to avoid duplicates
-              const exists = prev.some(bid => 
-                bid.amount === newBidEntry.amount && 
-                bid.bidder === newBidEntry.bidder
-              );
-              
-              if (exists) {
-                console.log("[DEBUG] Bid already in history, not adding duplicate");
-                return prev;
-              }
-              
-              // Add to beginning of array
-              const updatedHistory = [newBidEntry, ...prev];
-              console.log("[DEBUG] New history length:", updatedHistory.length);
-              return updatedHistory;
-            });
-            
-            // Fetch complete auction state after a short delay to ensure all data is synced
-            setTimeout(async () => {
-              console.log("[DEBUG] Refreshing auction state after bid");
-              try {
-                // Use the reliable getAuctionState function with retry capability
-                await fetchAuctionState();
-              } catch (error) {
-                console.error("[DEBUG] Error refreshing auction state:", error);
-              }
-            }, 1000);
-          } else {
-            console.log("[DEBUG] Bid failed:", response?.error || "Unknown error");
-            toast({
-              title: "Bid Failed",
-              description: response?.error || "Failed to place your bid. Please try again.",
-              variant: "destructive",
-            });
-            
-            // Refresh the auction state to get the latest data
-            fetchAuctionState();
-          }
-          
-          setIsPlacingBid(false);
-        });
-      });
-    } catch (error) {
-      console.error("[DEBUG] Error placing bid:", error);
-      
-      if (isMounted.current) {
-        toast({
-          title: "Bid Failed",
-          description: error instanceof Error ? error.message : "Failed to place your bid. Please try again.",
-          variant: "destructive",
-        });
-        setIsPlacingBid(false);
-        
-        // Refresh the auction state to ensure we're in sync
-        fetchAuctionState();
-      }
-    }
-  };
-  
-  // Add this function somewhere in the component body, before the return statement
-  const handleRefresh = () => {
-    console.log('LiveBidding: Manual refresh requested');
-    if (!product) return;
-    
-    // Show loading state
-    setIsLoading(true);
-    
-    // Request state update through socket
-    const socket = getSocket();
-    if (socket.connected) {
-      socket.emit("auction:requestStateUpdate", { auctionId: product.id }, (response) => {
-        console.log("Manual state update requested:", response);
-      });
-    }
-    
-    // Also fetch directly from API as a fallback
-    fetchAuctionState().finally(() => {
-      setIsLoading(false);
-    });
-    
-    // Show toast notification
-    toast({
-      title: "Refreshing auction data",
-      description: "Getting the latest bids and auction state...",
-    });
-  };
   
   // Return loading state
   if (isLoading) {
@@ -985,56 +684,62 @@ const LiveBidding = () => {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="mt-6">
-                <form onSubmit={handleSubmit} className="flex flex-col gap-2">
-                  <div className="relative">
-                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">$</span>
-                    <Input
-                      type="number"
-                      value={bidAmount || ''}
-                      onChange={(e) => setBidAmount(parseFloat(e.target.value))}
-                      className="pl-8"
-                      step="0.5"
-                      min={(product.currentBid || product.startingBid || 0) + 0.5}
-                      disabled={isPlacingBid || isAuctionEnded || !isAuthenticated}
-                      required
-                    />
-                  </div>
-                  <Button 
-                    type="submit"
-                    disabled={
-                      !isAuthenticated || 
-                      isPlacingBid || 
-                      isAuctionEnded || 
-                      !bidAmount ||
-                      bidAmount <= (product.currentBid || product.startingBid || 0)
-                    }
-                    className="w-full"
-                  >
-                    {isPlacingBid ? (
-                      <>
-                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                        Placing Bid...
-                      </>
-                    ) : isAuctionEnded ? (
-                      <>
-                        <Lock className="mr-2 h-4 w-4" />
-                        Auction Ended
-                      </>
-                    ) : !isAuthenticated ? (
-                      <>
-                        <UserCheck className="mr-2 h-4 w-4" />
-                        Sign In to Bid
-                      </>
-                    ) : (
-                      <>
-                        <Gavel className="mr-2 h-4 w-4" />
-                        Place Bid
-                      </>
-                    )}
-                  </Button>
-                </form>
+              <div className="flex flex-col md:flex-row gap-4">
+                <div className="flex-grow">
+                  <Input 
+                    type="number" 
+                    value={bidAmount?.toString() || ""}
+                    onChange={(e) => setBidAmount(parseFloat(e.target.value) || 0)}
+                    min={(product.currentBid || product.startingBid || 0) + 0.01}
+                    step="0.5"
+                    placeholder="Enter bid amount"
+                    className="text-lg"
+                    disabled={isAuctionEnded}
+                  />
+                  <p className="text-sm text-gray-500 mt-2">
+                    Minimum bid: ${((product.currentBid || product.startingBid || 0) + 0.5).toFixed(2)}
+                  </p>
+                </div>
+                <Button 
+                  onClick={handlePlaceBid}
+                  disabled={
+                    !isAuthenticated || 
+                    !bidAmount || 
+                    bidAmount <= (product.currentBid || product.startingBid || 0) ||
+                    isPlacingBid ||
+                    isAuctionEnded
+                  }
+                  className="bg-harvest-gold-600 hover:bg-harvest-gold-700 h-12 md:w-1/3"
+                >
+                  {isPlacingBid ? (
+                    <div className="flex items-center">
+                      <span className="animate-spin h-4 w-4 border-b-2 border-white mr-2"></span>
+                      Bidding...
+                    </div>
+                  ) : isAuctionEnded ? (
+                    <div className="flex items-center">
+                      <Lock className="h-4 w-4 mr-2" />
+                      Auction Ended
+                    </div>
+                  ) : (
+                    <div className="flex items-center">
+                      <Gavel className="h-4 w-4 mr-2" />
+                      Place Bid
+                    </div>
+                  )}
+                </Button>
               </div>
+              
+              {isAuctionEnded && (
+                <div className="mt-4 bg-amber-50 border border-amber-200 rounded-md p-3 flex items-start">
+                  <AlertTriangle className="h-5 w-5 text-amber-500 mt-0.5 mr-2" />
+                  <div>
+                    <p className="text-sm text-amber-800">
+                      This auction has ended and no more bids can be placed.
+                    </p>
+                  </div>
+                </div>
+              )}
               
               {!isAuthenticated && !isAuctionEnded && (
                 <div className="mt-4 bg-amber-50 border border-amber-200 rounded-md p-3 flex items-start">
@@ -1056,61 +761,37 @@ const LiveBidding = () => {
             </CardContent>
           </Card>
           
-          <Card className="mt-4">
+          <Card>
             <CardHeader>
-              <CardTitle>Bid History</CardTitle>
+              <CardTitle className="flex items-center">
+                <Award className="h-5 w-5 mr-2" />
+                Bid History
+              </CardTitle>
               <CardDescription>
-                {bidHistory.length > 0 
-                  ? `${bidHistory.length} bids placed so far` 
-                  : 'No bids placed yet'}
+                Recent bids on this product
               </CardDescription>
             </CardHeader>
             <CardContent>
               <div className="space-y-4 max-h-[400px] overflow-y-auto">
                 {bidHistory.length > 0 ? (
-                  bidHistory.map((bid, index) => {
-                    // Format timestamp consistently - ensure we always have a Date object
-                    const bidTime = bid.timestamp instanceof Date 
-                      ? bid.timestamp 
-                      : new Date(bid.timestamp || Date.now());
-                    
-                    // Format the time string
-                    const timeString = isNaN(bidTime.getTime()) 
-                      ? 'Unknown time' 
-                      : bidTime.toLocaleString();
-                    
-                    return (
-                      <div key={`${bid.amount}-${bid.bidder}-${index}`} className="flex justify-between items-center p-3 rounded-md bg-gray-50">
-                        <div>
-                          <p className="font-medium">{bid.bidder || 'Anonymous'}</p>
-                          <p className="text-sm text-gray-500">
-                            {timeString}
-                          </p>
-                        </div>
-                        <Badge className={index === 0 ? "bg-farm-green-600" : "bg-gray-600"}>
-                          ${(typeof bid.amount === 'number' ? bid.amount : 0).toFixed(2)}
-                        </Badge>
+                  bidHistory.map((bid, index) => (
+                    <div key={index} className="flex justify-between items-center p-3 rounded-md bg-gray-50">
+                      <div>
+                        <p className="font-medium">{bid.bidder}</p>
+                        <p className="text-sm text-gray-500">
+                          {new Date(bid.timestamp).toLocaleString()}
+                        </p>
                       </div>
-                    );
-                  })
+                      <Badge className={index === 0 ? "bg-farm-green-600" : "bg-gray-600"}>
+                        ${bid.amount.toFixed(2)}
+                      </Badge>
+                    </div>
+                  ))
                 ) : (
                   <div className="text-center py-8 text-gray-500">
                     <p>No bids placed yet. Be the first to bid!</p>
                   </div>
                 )}
-              </div>
-              
-              {/* Add refresh button for manual refreshing */}
-              <div className="mt-4 flex justify-center">
-                <Button 
-                  size="sm" 
-                  variant="outline" 
-                  onClick={handleRefresh} 
-                  disabled={isLoading || !getSocket().connected}
-                >
-                  {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                  Refresh
-                </Button>
               </div>
             </CardContent>
           </Card>

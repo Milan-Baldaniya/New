@@ -320,7 +320,7 @@ const placeBid = async (req, res) => {
     // If socket.io is available, emit the bid event
     if (io) {
       // Emit to all clients in the auction room
-      io.to(id).emit('newBid', {
+      io.to(id).emit('auction:bid', {
         auctionId: id,
         amount: bidAmount,
         bidder: {
