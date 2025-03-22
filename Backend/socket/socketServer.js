@@ -225,29 +225,34 @@ function createSocketServer(httpServer, options = {}) {
       logger.info(`Getting auction state: ${auctionId} by client ${socketId}`);
       
       try {
-        // Get auction with bids from service
-        const { auction, bids } = await auctionService.getAuctionWithBids(auctionId);
+        // Get auction from database
+        const auction = await Auction.findById(auctionId);
         
-        // Format bid history for client
+        // Get recent bids from database - Ensure bids are returned in the correct order
+        const bids = await Bid.find({ auction: auctionId })
+          .sort({ timestamp: -1 })  // Sort by timestamp descending (newest first)
+          .limit(50);
+        
+        // DEBUGGING - Log the bids we're returning
+        logger.info(`DEBUG: Found ${bids.length} bids for auction ${auctionId} in database`);
+        
+        // Map bids to the correct format
         const bidHistory = bids.map(bid => ({
           amount: bid.amount,
           bidder: bid.bidderName || 'Anonymous',
           timestamp: bid.timestamp
         }));
         
-        // Update in-memory cache
-        auctionData.set(auctionId, {
-          currentBid: auction.currentBid || null,
-          bidder: auction.currentBidder || null,
-          lastUpdated: auction.lastBidTime || null,
-          bidHistory
-        });
+        // DEBUGGING - Log in-memory cached data
+        const cachedData = auctionData.get(auctionId);
+        logger.info(`DEBUG: In-memory cached bid history has ${cachedData?.bidHistory?.length || 0} items`);
         
+        // Always include in-memory data for rapid updates
         if (typeof callback === 'function') {
           callback({
             success: true,
             auctionId,
-            product: {
+            product: auction ? {
               id: auction._id,
               name: auction.name,
               currentBid: auction.currentBid,
@@ -255,8 +260,8 @@ function createSocketServer(httpServer, options = {}) {
               startingBid: auction.startingBid,
               endBidTime: auction.endBidTime,
               status: auction.status
-            },
-            bidHistory,
+            } : null,
+            bidHistory: bidHistory.length > 0 ? bidHistory : (cachedData?.bidHistory || []),
             timestamp: new Date().toISOString()
           });
         }
@@ -354,6 +359,56 @@ function createSocketServer(httpServer, options = {}) {
       }
     });
     
+    // Add a helper function to broadcast full auction state after a bid is placed
+    const broadcastAuctionState = async (io, auctionId) => {
+      try {
+        // Get auction data from database
+        const auction = await Auction.findById(auctionId);
+        if (!auction) {
+          logger.warn(`broadcastAuctionState: Auction ${auctionId} not found`);
+          return;
+        }
+        
+        // Get bid history
+        const bids = await Bid.find({ auction: auctionId })
+          .sort({ timestamp: -1 })
+          .limit(50);
+        
+        // Format bid history for clients
+        const bidHistory = bids.map(bid => ({
+          amount: bid.amount,
+          bidder: bid.bidderName || 'Anonymous',
+          timestamp: bid.timestamp
+        }));
+        
+        // Prepare state object
+        const stateData = {
+          auctionId,
+          product: {
+            id: auction._id,
+            name: auction.name,
+            currentBid: auction.currentBid,
+            bidder: auction.currentBidder,
+            startingBid: auction.startingBid,
+            endBidTime: auction.endBidTime,
+            status: auction.status
+          },
+          bidHistory,
+          timestamp: new Date().toISOString()
+        };
+        
+        // Broadcast to auction room
+        const roomId = `auction:${auctionId}`;
+        logger.info(`broadcastAuctionState: Broadcasting state update to room ${roomId} with ${bidHistory.length} bids`);
+        io.to(roomId).emit('auction:stateUpdate', stateData);
+        
+        return stateData;
+      } catch (error) {
+        logger.error(`broadcastAuctionState: Error broadcasting state: ${error.message}`);
+        return null;
+      }
+    };
+    
     // Handle bid placement
     socket.on('auction:bid', async (data, callback) => {
       const { auctionId, amount, userId, bidder, timestamp } = data;
@@ -372,11 +427,16 @@ function createSocketServer(httpServer, options = {}) {
       logger.info(`New bid: ${auctionId}, $${amount} by user ${userId}`);
       
       try {
-        // Use service to place bid
-        const bidderName = typeof bidder === 'object' ? bidder.name : 'Anonymous';
-        const { bid, auction } = await auctionService.placeBid(auctionId, amount, userId, bidderName);
+        // DEBUGGING - Log the bid data we're saving
+        logger.info(`DEBUG: Saving bid with details: ${JSON.stringify({
+          auction: auctionId,
+          amount: amount,
+          bidder: userId,
+          bidderName: typeof bidder === 'object' ? bidder.name : 'Anonymous',
+          timestamp: timestamp || new Date()
+        })}`);
         
-        // Create response data
+        // Save bid to database
         const bidData = {
           auctionId,
           amount,
@@ -385,7 +445,36 @@ function createSocketServer(httpServer, options = {}) {
           timestamp: timestamp || new Date().toISOString()
         };
         
-        // Update in-memory cache
+        // Create new bid in database
+        const newBid = new Bid({
+          auction: auctionId,
+          amount: amount,
+          bidder: userId,
+          bidderName: typeof bidder === 'object' ? bidder.name : 'Anonymous',
+          timestamp: timestamp || new Date()
+        });
+        
+        await newBid.save();
+        logger.info(`Bid saved to database: ${newBid._id}`);
+        
+        // Update auction with latest bid
+        const updatedAuction = await Auction.findByIdAndUpdate(
+          auctionId,
+          { 
+            currentBid: amount,
+            currentBidder: userId,
+            lastBidTime: timestamp || new Date()
+          },
+          { new: true }
+        );
+        
+        if (!updatedAuction) {
+          logger.warn(`Failed to update auction ${auctionId} with new bid`);
+        } else {
+          logger.info(`Auction ${auctionId} updated with new bid`);
+        }
+        
+        // Store bid data in memory for quick sync
         if (!auctionData.has(auctionId)) {
           auctionData.set(auctionId, {
             currentBid: amount,
@@ -404,7 +493,7 @@ function createSocketServer(httpServer, options = {}) {
           // Add to bid history
           auctionCache.bidHistory.unshift({
             amount,
-            bidder: bidderName,
+            bidder: typeof bidder === 'object' ? bidder.name : 'Anonymous',
             timestamp: timestamp || new Date().toISOString()
           });
           
@@ -416,7 +505,16 @@ function createSocketServer(httpServer, options = {}) {
         
         // Broadcast bid to auction room
         const roomId = `auction:${auctionId}`;
+        
+        // DEBUGGING - Log what we're broadcasting
+        logger.info(`DEBUG: Broadcasting bid to room ${roomId}: ${JSON.stringify(bidData)}`);
+        
         io.to(roomId).emit('auction:bid', bidData);
+        
+        // After a short delay, broadcast the full auction state to ensure all clients have the latest data
+        setTimeout(async () => {
+          await broadcastAuctionState(io, auctionId);
+        }, 500);
         
         if (typeof callback === 'function') {
           callback({
@@ -431,6 +529,32 @@ function createSocketServer(httpServer, options = {}) {
           callback({
             success: false,
             error: error.message || 'Failed to save bid'
+          });
+        }
+      }
+    });
+    
+    // Add a new event handler for clients to request state updates
+    socket.on('auction:requestStateUpdate', async (data, callback) => {
+      const { auctionId } = data;
+      logger.info(`Client ${socketId} requested state update for auction ${auctionId}`);
+      
+      try {
+        const stateData = await broadcastAuctionState(io, auctionId);
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: true,
+            message: 'State update broadcast initiated'
+          });
+        }
+      } catch (error) {
+        logger.error(`Error broadcasting state update: ${error.message}`);
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: false,
+            error: 'Failed to broadcast state update'
           });
         }
       }

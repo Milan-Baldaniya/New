@@ -10,6 +10,10 @@ let socket: Socket | null = null;
 let currentUserId: string | null = null;
 let currentAuctionId: string | null = null;
 
+// Add retry configuration
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
+
 /**
  * Get the WebSocket server URL based on environment
  * @returns {string} WebSocket server URL
@@ -287,46 +291,72 @@ export function onBid(handler: (data: any) => void): () => void {
 }
 
 /**
- * Get the latest bid for an auction
+ * Get auction state with retries
  * @param {string} auctionId - Auction ID
- * @returns {Promise<object>} Promise resolving to latest bid data
+ * @param {number} retries - Number of retries left (default: MAX_RETRIES)
+ * @returns {Promise<object>} Promise resolving to auction state
  */
-export function getLatestBid(auctionId: string): Promise<any> {
+export function getAuctionState(auctionId: string, retries = MAX_RETRIES): Promise<any> {
   return new Promise((resolve, reject) => {
     const socketInstance = getSocket();
-    if (DEBUG_MODE) console.log(`[Socket] Getting latest bid for auction: ${auctionId}`);
+    if (DEBUG_MODE) console.log(`[Socket] Getting auction state for ${auctionId}, retries left: ${retries}`);
     
-    socketInstance.emit('auction:getLatestBid', { auctionId }, (response: any) => {
+    socketInstance.emit('auction:getState', { auctionId }, (response: any) => {
       if (response && response.success) {
-        if (DEBUG_MODE) console.log(`[Socket] Received latest bid for auction ${auctionId}:`, response.bid);
+        if (DEBUG_MODE) console.log(`[Socket] Got auction state for ${auctionId}:`, 
+          response.product ? `Current bid: ${response.product.currentBid}, Bid history: ${response.bidHistory?.length} items` : 'No product data');
         resolve(response);
       } else {
-        const error = response?.error || 'Failed to get latest bid';
-        console.error(`[Socket] Error getting latest bid: ${error}`);
-        reject(new Error(error));
+        const error = response?.error || 'Failed to get auction state';
+        console.error(`[Socket] Error getting auction state: ${error}`);
+        
+        // Retry logic
+        if (retries > 0 && socketInstance.connected) {
+          if (DEBUG_MODE) console.log(`[Socket] Retrying getAuctionState for ${auctionId} in ${RETRY_DELAY}ms, ${retries} retries left`);
+          setTimeout(() => {
+            getAuctionState(auctionId, retries - 1)
+              .then(resolve)
+              .catch(reject);
+          }, RETRY_DELAY);
+        } else {
+          reject(new Error(error));
+        }
       }
     });
   });
 }
 
 /**
- * Get the current state of an auction including product and bid history
+ * Get latest bid for an auction with retries
  * @param {string} auctionId - Auction ID
- * @returns {Promise<object>} Promise resolving to auction state data
+ * @param {number} retries - Number of retries left (default: MAX_RETRIES)
+ * @returns {Promise<object>} Promise resolving to latest bid
  */
-export function getAuctionState(auctionId: string): Promise<any> {
+export function getLatestBid(auctionId: string, retries = MAX_RETRIES): Promise<any> {
   return new Promise((resolve, reject) => {
     const socketInstance = getSocket();
-    if (DEBUG_MODE) console.log(`[Socket] Getting state for auction: ${auctionId}`);
+    if (DEBUG_MODE) console.log(`[Socket] Getting latest bid for ${auctionId}, retries left: ${retries}`);
     
-    socketInstance.emit('auction:getState', { auctionId }, (response: any) => {
+    socketInstance.emit('auction:getLatestBid', { auctionId }, (response: any) => {
       if (response && response.success) {
-        if (DEBUG_MODE) console.log(`[Socket] Received state for auction ${auctionId}:`, response);
+        if (DEBUG_MODE) console.log(`[Socket] Got latest bid for ${auctionId}:`, 
+          response.bid ? `Amount: ${response.bid.amount}` : 'No bids yet');
         resolve(response);
       } else {
-        const error = response?.error || 'Failed to get auction state';
-        console.error(`[Socket] Error getting auction state: ${error}`);
-        reject(new Error(error));
+        const error = response?.error || 'Failed to get latest bid';
+        console.error(`[Socket] Error getting latest bid: ${error}`);
+        
+        // Retry logic
+        if (retries > 0 && socketInstance.connected) {
+          if (DEBUG_MODE) console.log(`[Socket] Retrying getLatestBid for ${auctionId} in ${RETRY_DELAY}ms, ${retries} retries left`);
+          setTimeout(() => {
+            getLatestBid(auctionId, retries - 1)
+              .then(resolve)
+              .catch(reject);
+          }, RETRY_DELAY);
+        } else {
+          reject(new Error(error));
+        }
       }
     });
   });

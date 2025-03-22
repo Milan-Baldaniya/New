@@ -138,14 +138,31 @@ If you encounter issues with the bidding functionality, check the following:
 
 ## Recent Improvements
 
-We've made several enhancements to improve cross-device bidding reliability:
+We have implemented several key improvements to ensure reliable cross-device bidding functionality:
 
-1. Added data synchronization with `auction:getState` and `auction:getLatestBid` events
-2. Implemented server-side auction state tracking for better consistency
-3. Added periodic checks for missed bid updates
-4. Enhanced error handling and reconnection logic
-5. Improved logging for easier troubleshooting
-6. **Added database persistence for all auction data**
+1. **Enhanced Data Synchronization**
+   - All bids are now properly saved to the MongoDB database
+   - Real-time bidding updates are broadcasted to all connected clients
+   - New state update mechanism ensures all clients receive the latest auction data
+
+2. **Improved Recovery Mechanisms**
+   - Added automatic state synchronization when a page becomes visible after being hidden
+   - Implemented a manual refresh button to force state updates from the server
+   - Added periodic background checks to ensure bid history stays in sync
+
+3. **Better Error Handling**
+   - Improved error messages and notifications
+   - Added more detailed logging for debugging purposes
+   - Enhanced data validation to prevent inconsistent states
+
+4. **User Experience Enhancements**
+   - Toast notifications for new bids and state updates
+   - Loading indicators during refresh operations
+   - Clear indication of connection status
+
+## Testing Tools
+
+In addition to these instructions, we've provided a detailed testing script in `TEST-BIDDING-SCRIPT.md` that outlines specific test cases to verify the bidding functionality. Use this script to methodically test all aspects of the bidding system.
 
 ### Database Persistence
 
