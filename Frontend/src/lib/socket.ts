@@ -10,10 +10,6 @@ let socket: Socket | null = null;
 let currentUserId: string | null = null;
 let currentAuctionId: string | null = null;
 
-// Add retry configuration
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
-
 /**
  * Get the WebSocket server URL based on environment
  * @returns {string} WebSocket server URL
@@ -63,11 +59,11 @@ export function createSocket(): Socket {
 
   // Create socket instance with reconnection enabled
   socket = io(url, {
-    transports: ['websocket', 'polling'], // Try websocket first, fall back to polling
+    transports: ['polling', 'websocket'], // Try polling first, then websocket - this avoids WebSocket connection failures
     reconnection: true,
-    reconnectionAttempts: 5,
-    reconnectionDelay: 1000,
-    timeout: 20000,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 2000,
+    timeout: 30000,
     forceNew: true // Force a new connection
   });
 
@@ -78,22 +74,16 @@ export function createSocket(): Socket {
 
   socket.on('connect_error', (error) => {
     console.error(`[Socket] Connection error: ${error.message}`);
-    console.log(`[Socket] Connection details: URL=${url}, Transport=${socket.io.engine.transport.name}`);
+    console.log(`[Socket] Connection details: URL=${url}, Transport=${socket.io.engine?.transport?.name || 'unknown'}`);
     
     // If we're on websocket and it failed, try polling
-    if (socket.io.engine.transport.name === 'websocket') {
+    if (socket.io.engine?.transport?.name === 'websocket') {
       if (DEBUG_MODE) console.log('[Socket] WebSocket failed, switching to polling transport');
-      // Force close the websocket transport
-      socket.io.engine.transport.close();
       
-      // Explicitly set transports to only use polling
+      // Set transports to only use polling
       socket.io.opts.transports = ['polling'];
       
-      // Try to reconnect immediately
-      setTimeout(() => {
-        if (DEBUG_MODE) console.log('[Socket] Attempting reconnect with polling transport');
-        socket.connect();
-      }, 100);
+      console.log('[Socket] Switched to polling transport only, reconnecting...');
     }
   });
 
@@ -220,39 +210,52 @@ export function placeBid(auctionId: string, amount: number, userId?: string): Pr
     const socketInstance = getSocket();
     if (DEBUG_MODE) console.log(`[Socket] Placing bid of $${amount} on auction ${auctionId} by user ${bidUserId}`);
     
-    // First check if the auction is still active
-    socketInstance.emit('auction:status', { auctionId }, (response: any) => {
-      if (response && response.success) {
-        if (response.isEnded) {
-          const error = 'This auction has ended and no more bids can be placed';
-          console.error(`[Socket] ${error}`);
-          reject(new Error(error));
+    // Ensure socket is connected before attempting to place bid
+    if (!socketInstance.connected) {
+      console.error(`[Socket] Cannot place bid - socket is not connected`);
+      // Try to reconnect
+      socketInstance.connect();
+      
+      // Wait briefly for connection to establish
+      setTimeout(() => {
+        if (!socketInstance.connected) {
+          reject(new Error('Socket is not connected. Please try again.'));
           return;
+        } else {
+          // Now that we're connected, place the bid directly
+          placeBidDirectly();
         }
+      }, 1000);
+    } else {
+      // Socket is already connected, place bid directly
+      placeBidDirectly();
+    }
+    
+    function placeBidDirectly() {
+      // Create bid data
+      const bidData = {
+        auctionId,
+        amount,
+        userId: bidUserId,
+        timestamp: new Date()
+      };
+      
+      console.log(`[Socket] Emitting auction:bid with data:`, bidData);
+      
+      // Skip status check and emit bid directly
+      socketInstance.emit('auction:bid', bidData, (bidResponse: any) => {
+        console.log(`[Socket] Bid response received:`, bidResponse);
         
-        // Auction is active, proceed with the bid
-        const bidData = {
-          auctionId,
-          amount,
-          userId: bidUserId
-        };
-        
-        socketInstance.emit('auction:bid', bidData, (bidResponse: any) => {
-          if (bidResponse && bidResponse.success) {
-            if (DEBUG_MODE) console.log(`[Socket] Bid placed successfully on auction ${auctionId}: $${amount}`);
-            resolve(bidResponse);
-          } else {
-            const error = bidResponse?.error || 'Failed to place bid';
-            console.error(`[Socket] Error placing bid: ${error}`);
-            reject(new Error(error));
-          }
-        });
-      } else {
-        const error = response?.error || 'Failed to check auction status';
-        console.error(`[Socket] ${error}`);
-        reject(new Error(error));
-      }
-    });
+        if (bidResponse && bidResponse.success) {
+          console.log(`[Socket] Bid placed successfully on auction ${auctionId}: $${amount}`);
+          resolve(bidResponse);
+        } else {
+          const error = bidResponse?.error || 'Failed to place bid';
+          console.error(`[Socket] Error placing bid: ${error}`);
+          reject(new Error(error));
+        }
+      });
+    }
   });
 }
 
@@ -288,78 +291,6 @@ export function onBid(handler: (data: any) => void): () => void {
     if (DEBUG_MODE) console.log('[Socket] Unregistering auction:bid handler');
     socketInstance.off('auction:bid', handler);
   };
-}
-
-/**
- * Get auction state with retries
- * @param {string} auctionId - Auction ID
- * @param {number} retries - Number of retries left (default: MAX_RETRIES)
- * @returns {Promise<object>} Promise resolving to auction state
- */
-export function getAuctionState(auctionId: string, retries = MAX_RETRIES): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const socketInstance = getSocket();
-    if (DEBUG_MODE) console.log(`[Socket] Getting auction state for ${auctionId}, retries left: ${retries}`);
-    
-    socketInstance.emit('auction:getState', { auctionId }, (response: any) => {
-      if (response && response.success) {
-        if (DEBUG_MODE) console.log(`[Socket] Got auction state for ${auctionId}:`, 
-          response.product ? `Current bid: ${response.product.currentBid}, Bid history: ${response.bidHistory?.length} items` : 'No product data');
-        resolve(response);
-      } else {
-        const error = response?.error || 'Failed to get auction state';
-        console.error(`[Socket] Error getting auction state: ${error}`);
-        
-        // Retry logic
-        if (retries > 0 && socketInstance.connected) {
-          if (DEBUG_MODE) console.log(`[Socket] Retrying getAuctionState for ${auctionId} in ${RETRY_DELAY}ms, ${retries} retries left`);
-          setTimeout(() => {
-            getAuctionState(auctionId, retries - 1)
-              .then(resolve)
-              .catch(reject);
-          }, RETRY_DELAY);
-        } else {
-          reject(new Error(error));
-        }
-      }
-    });
-  });
-}
-
-/**
- * Get latest bid for an auction with retries
- * @param {string} auctionId - Auction ID
- * @param {number} retries - Number of retries left (default: MAX_RETRIES)
- * @returns {Promise<object>} Promise resolving to latest bid
- */
-export function getLatestBid(auctionId: string, retries = MAX_RETRIES): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const socketInstance = getSocket();
-    if (DEBUG_MODE) console.log(`[Socket] Getting latest bid for ${auctionId}, retries left: ${retries}`);
-    
-    socketInstance.emit('auction:getLatestBid', { auctionId }, (response: any) => {
-      if (response && response.success) {
-        if (DEBUG_MODE) console.log(`[Socket] Got latest bid for ${auctionId}:`, 
-          response.bid ? `Amount: ${response.bid.amount}` : 'No bids yet');
-        resolve(response);
-      } else {
-        const error = response?.error || 'Failed to get latest bid';
-        console.error(`[Socket] Error getting latest bid: ${error}`);
-        
-        // Retry logic
-        if (retries > 0 && socketInstance.connected) {
-          if (DEBUG_MODE) console.log(`[Socket] Retrying getLatestBid for ${auctionId} in ${RETRY_DELAY}ms, ${retries} retries left`);
-          setTimeout(() => {
-            getLatestBid(auctionId, retries - 1)
-              .then(resolve)
-              .catch(reject);
-          }, RETRY_DELAY);
-        } else {
-          reject(new Error(error));
-        }
-      }
-    });
-  });
 }
 
 /**
@@ -444,7 +375,5 @@ export default {
   placeBid,
   onAuctionUpdate,
   onBid,
-  checkConnection,
-  getLatestBid,
-  getAuctionState
+  checkConnection
 }; 

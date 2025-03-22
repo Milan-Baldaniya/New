@@ -242,31 +242,76 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     try {
       console.log(`Placing bid of $${amount} on product ${productId}`);
       
-      // First, emit the bid via socket for real-time updates
-      // The socket.ts placeBid requires auctionId, amount, userId
-      await emitBid(productId, amount, user.id);
-      
-      // Then call the API to record the bid in the database
-      const updatedProduct = await productService.placeBid(productId, amount);
-      
-      if (!updatedProduct) {
-        console.warn("No product data returned after placing bid");
-        throw new Error("No product data returned from bid");
+      // Call API first to record the bid in the database
+      // This ensures the bid is saved even if socket fails
+      try {
+        const updatedProduct = await productService.placeBid(productId, amount);
+        
+        if (!updatedProduct) {
+          console.warn("No product data returned after placing bid");
+          throw new Error("No product data returned from bid");
+        }
+        
+        console.log("Received updated product after bid:", updatedProduct);
+        
+        // Update the products list with the new bid information
+        setProducts(prevProducts => 
+          prevProducts.map(product => 
+            product.id === productId
+              ? { ...updatedProduct }
+              : product
+          )
+        );
+        
+        // Also update featured products if this product is featured
+        setFeaturedProducts(prevFeatured => 
+          prevFeatured.map(product => 
+            product.id === productId
+              ? { ...updatedProduct }
+              : product
+          )
+        );
+        
+        // Now emit the bid via socket for real-time updates to other users
+        // Even if this fails, our database already has the bid recorded
+        try {
+          const socketResponse = await emitBid(productId, amount, user.id);
+          console.log("Socket bid response:", socketResponse);
+        } catch (socketError) {
+          console.error("Socket bid error:", socketError);
+          // Continue since API call was successful
+        }
+        
+        return updatedProduct;
+      } catch (apiError) {
+        console.error("API bid error:", apiError);
+        
+        // If API fails but socket is connected, try socket bid as fallback
+        try {
+          console.log("Attempting socket bid as fallback");
+          const socketResponse = await emitBid(productId, amount, user.id);
+          console.log("Fallback socket bid response:", socketResponse);
+          
+          // If socket bid succeeds, return a basic product update
+          // This isn't ideal but prevents a complete failure
+          if (socketResponse && socketResponse.success) {
+            const product = products.find(p => p.id === productId);
+            if (product) {
+              const updatedProduct = {
+                ...product,
+                currentBid: amount,
+                bidder: user
+              };
+              return updatedProduct;
+            }
+          }
+        } catch (socketError) {
+          console.error("Fallback socket bid also failed:", socketError);
+        }
+        
+        // Both API and socket failed
+        throw apiError; 
       }
-      
-      console.log("Received updated product after bid:", updatedProduct);
-      
-      // The product state will be updated by the socket event listener
-      // We still update it here to ensure consistency
-      setProducts(prevProducts => 
-        prevProducts.map(product => 
-          product.id === productId
-            ? { ...updatedProduct }
-            : product
-        )
-      );
-      
-      return updatedProduct;
     } catch (error) {
       console.error("Error placing bid:", error);
       toast({

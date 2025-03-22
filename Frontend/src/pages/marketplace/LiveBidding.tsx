@@ -18,7 +18,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { AlertCircle, ArrowLeft, Clock, Gavel, Users, UserCheck, Award, RefreshCw, Lock, AlertTriangle } from "lucide-react";
 import { Product } from "@/services/productService";
-import { getSocket, getSocketUrl, createSocket, checkConnection } from "@/lib/socket";
+import { getSocket, getSocketUrl, createSocket, checkConnection, closeSocket } from "@/lib/socket";
 
 const LiveBidding = () => {
   const { id } = useParams<{ id: string }>();
@@ -48,7 +48,14 @@ const LiveBidding = () => {
   const isMounted = useRef(true);
   const productRef = useRef<Product | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const hasLoaded = useRef(false); // Track if we've already loaded the product
+  const hasLoaded = useRef(false);
+  
+  // Save bid history to localStorage whenever it changes
+  useEffect(() => {
+    if (id && bidHistory.length > 0) {
+      localStorage.setItem(`bidHistory-${id}`, JSON.stringify(bidHistory));
+    }
+  }, [bidHistory, id]);
   
   // Debug socket connection on component mount
   useEffect(() => {
@@ -66,6 +73,14 @@ const LiveBidding = () => {
     console.log('Socket instance:', socket);
     console.log('Socket connected:', socket?.connected);
     console.log('Socket ID:', socket?.id);
+    
+    // Create a new socket instance if existing one fails to connect
+    if (!socket.connected && !socket.connecting) {
+      console.log('LiveBidding: Socket not connected or connecting, creating a fresh instance');
+      // Force close existing socket if any
+      socket.close();
+      socket = createSocket();
+    }
     
     // Check socket connection
     const isConnected = checkConnection();
@@ -127,7 +142,8 @@ const LiveBidding = () => {
     socket.on('disconnect', handleDisconnect);
     socket.on('connect_error', handleConnectionError);
     
-    // Set up a periodic check for the socket connection
+    // Set up a periodic check for the socket connection - but less frequently
+    // to reduce console noise and prevent continuous reconnection attempts
     const connectionCheckInterval = setInterval(() => {
       if (isMounted.current && !socketConnected) {
         console.log('LiveBidding: Checking socket connection...');
@@ -139,9 +155,10 @@ const LiveBidding = () => {
           setReconnecting(false);
         }
       }
-    }, 5000); // Check every 5 seconds
+    }, 15000); // Check every 15 seconds instead of 5 seconds
     
     return () => {
+      isMounted.current = false;
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off('connect_error', handleConnectionError);
@@ -151,6 +168,50 @@ const LiveBidding = () => {
       if (socket.connected && id) {
         socket.emit("auction:leave", id);
       }
+      
+      // Clean up old bid history items from localStorage (older than 7 days)
+      const cleanupLocalStorage = () => {
+        try {
+          // Get all keys in localStorage
+          const localStorageKeys = Object.keys(localStorage);
+          
+          // Filter keys that start with "bidHistory-"
+          const bidHistoryKeys = localStorageKeys.filter(key => key.startsWith('bidHistory-'));
+          
+          // Set cutoff date to 7 days ago
+          const cutoffDate = new Date();
+          cutoffDate.setDate(cutoffDate.getDate() - 7);
+          
+          // Go through each bidHistory item
+          bidHistoryKeys.forEach(key => {
+            try {
+              // Skip the current auction's history
+              if (id && key === `bidHistory-${id}`) return;
+              
+              const historyData = localStorage.getItem(key);
+              if (!historyData) return;
+              
+              const parsedHistory = JSON.parse(historyData);
+              
+              // Check if this history is older than the cutoff date
+              // Look at the most recent bid (the first one) timestamp
+              if (parsedHistory.length > 0) {
+                const latestBidTime = new Date(parsedHistory[0].timestamp);
+                if (latestBidTime < cutoffDate) {
+                  console.log(`LiveBidding: Removing old bid history for ${key}`);
+                  localStorage.removeItem(key);
+                }
+              }
+            } catch (e) {
+              console.error(`LiveBidding: Error cleaning up localStorage key ${key}:`, e);
+            }
+          });
+        } catch (e) {
+          console.error('LiveBidding: Error during localStorage cleanup:', e);
+        }
+      };
+      
+      cleanupLocalStorage();
     };
   }, [id]);
   
@@ -234,9 +295,26 @@ const LiveBidding = () => {
         const minimumNextBid = (productData.currentBid || productData.startingBid || 0) + 0.5;
         setBidAmount(minimumNextBid);
         
-        // Initialize bid history
-        if (bidHistory.length === 0) {
-          // Either fetch actual bid history or generate mock data
+        // Try to load bid history from localStorage first
+        const savedBidHistory = localStorage.getItem(`bidHistory-${id}`);
+        if (savedBidHistory) {
+          try {
+            // Parse stored history and convert string timestamps back to Date objects
+            const parsedHistory = JSON.parse(savedBidHistory);
+            const historyWithDateObjects = parsedHistory.map((bid: any) => ({
+              ...bid,
+              timestamp: new Date(bid.timestamp)
+            }));
+            setBidHistory(historyWithDateObjects);
+            console.log('LiveBidding: Loaded bid history from localStorage:', historyWithDateObjects);
+          } catch (e) {
+            console.error('LiveBidding: Error parsing bid history from localStorage:', e);
+            // If there's an error loading from localStorage, generate mock data
+            const mockBidHistory = generateMockBidHistory(productData);
+            setBidHistory(mockBidHistory);
+          }
+        } else if (bidHistory.length === 0) {
+          // If no saved history exists, generate mock data
           const mockBidHistory = generateMockBidHistory(productData);
           setBidHistory(mockBidHistory);
           setParticipants(Math.floor(Math.random() * 10) + 3);
@@ -280,75 +358,162 @@ const LiveBidding = () => {
     console.log('LiveBidding: Socket connected status:', getSocket().connected);
     console.log('LiveBidding: Socket ID:', getSocket().id);
     
+    const socket = getSocket();
+    
+    // Check for socket connection issues and reconnect if needed
+    if (!socket.connected) {
+      console.log('LiveBidding: Socket not connected, attempting to connect');
+      socket.connect();
+      
+      // Force reconnect if still not connected
+      if (!socket.connected) {
+        console.log('LiveBidding: Socket still not connected after connect() call, creating new socket');
+        createSocket();
+      }
+    }
+    
     // Join the auction room
-    getSocket().emit("auction:join", product.id, (response) => {
+    socket.emit("auction:join", product.id, (response) => {
       console.log("Joined auction room:", response);
       // Update participant count on successful join
       if (response && response.success) {
         setParticipants(response.participantCount);
+      } else {
+        console.error("Failed to join auction room:", response);
+        // Try again after a short delay
+        setTimeout(() => {
+          if (isMounted.current) {
+            socket.emit("auction:join", product.id);
+          }
+        }, 2000);
       }
     });
     
     // Confirm connection status
-    console.log(`LiveBidding: Socket connected: ${getSocket().connected ? 'Yes' : 'No'}, ID: ${getSocket().id}`);
+    console.log(`LiveBidding: Socket connected: ${socket.connected ? 'Yes' : 'No'}, ID: ${socket.id}`);
     
     // Listen for new bids
     const handleNewBid = (data: any) => {
       console.log(`LiveBidding: Received new bid:`, data);
       if (!isMounted.current) return;
       
-      // Update product with new bid
-      setProduct(prevProduct => {
-        if (!prevProduct) return null;
+      // Validate the bid data
+      if (!data || typeof data !== 'object') {
+        console.error('Invalid bid data received:', data);
+        return;
+      }
+      
+      // Ensure this bid is for the current auction
+      if (data.auctionId && data.auctionId !== product.id) {
+        console.log(`Ignoring bid for different auction: ${data.auctionId}`);
+        return;
+      }
+      
+      // Extract values with proper fallbacks
+      const amount = typeof data.amount === 'number' ? data.amount : 0;
+      const bidder = data.bidder || { name: 'Anonymous' };
+      const bidderName = typeof bidder === 'object' && bidder !== null 
+        ? (bidder.name || 'Anonymous') 
+        : (typeof bidder === 'string' ? bidder : 'Anonymous');
+      const timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
+      
+      // Update product with new bid if amount is valid
+      if (amount > 0) {
+        setProduct(prevProduct => {
+          if (!prevProduct) return null;
+          
+          return {
+            ...prevProduct,
+            currentBid: amount,
+            bidder: bidder
+          };
+        });
         
-        return {
-          ...prevProduct,
-          currentBid: data.amount,
-          bidder: data.bidder
+        // Update product ref for timer calculations
+        if (productRef.current) {
+          productRef.current = {
+            ...productRef.current,
+            currentBid: amount,
+            bidder: bidder
+          };
+        }
+        
+        // Update bid history
+        const newBid = {
+          amount,
+          bidder: bidderName,
+          timestamp
         };
-      });
-      
-      // Update bid history
-      setBidHistory(prev => [
-        {
-          amount: data.amount,
-          bidder: typeof data.bidder === 'object' ? data.bidder.name : 'Anonymous',
-          timestamp: new Date(data.timestamp)
-        },
-        ...prev
-      ]);
-      
-      // Update minimum bid amount
-      setBidAmount(data.amount + 0.5);
-      
-      // Show toast notification
-      toast({
-        title: "New Bid Placed!",
-        description: `${typeof data.bidder === 'object' ? data.bidder.name : 'Anonymous'} bid $${data.amount.toFixed(2)}`,
-      });
+        
+        setBidHistory(prev => {
+          // Check if this bid is already in history (avoid duplicates)
+          const isDuplicate = prev.some(existingBid => 
+            existingBid.amount === amount && 
+            existingBid.bidder === bidderName &&
+            Math.abs(existingBid.timestamp.getTime() - timestamp.getTime()) < 1000
+          );
+          
+          if (isDuplicate) {
+            console.log('Duplicate bid detected, not adding to history');
+            return prev;
+          }
+          
+          return [newBid, ...prev];
+        });
+        
+        // Update minimum bid amount
+        setBidAmount(amount + 0.5);
+        
+        // Show toast notification
+        toast({
+          title: "New Bid Placed!",
+          description: `${bidderName} bid $${amount.toFixed(2)}`,
+        });
+      } else {
+        console.warn('Received invalid bid amount:', amount);
+      }
     };
     
     // Listen for participant count updates
     const handleParticipantUpdate = (data: any) => {
       console.log(`LiveBidding: Participant update:`, data);
-      if (isMounted.current && data.auctionId === product.id) {
-        setParticipants(data.participantCount);
+      if (isMounted.current && data && data.auctionId === product.id) {
+        setParticipants(data.participantCount || 0);
       }
     };
     
-    getSocket().on("auction:bid", handleNewBid);
-    getSocket().on("auction:update", handleParticipantUpdate);
+    // Listen for auction status updates
+    const handleAuctionStatus = (data: any) => {
+      console.log(`LiveBidding: Auction status update:`, data);
+      if (isMounted.current && data && data.auctionId === product.id) {
+        // Check if auction has ended
+        if (data.isEnded) {
+          setIsAuctionEnded(true);
+          setTimeLeft("Auction ended");
+        }
+      }
+    };
+    
+    // Register event listeners
+    socket.on("auction:bid", handleNewBid);
+    socket.on("auction:update", handleParticipantUpdate);
+    socket.on("auction:status", handleAuctionStatus);
     
     return () => {
       console.log('LiveBidding: Cleaning up socket connections');
       // Leave the auction room
-      getSocket().emit("auction:leave", product.id, (response) => {
-        console.log("Left auction room:", response);
-      });
-      getSocket().off("auction:bid", handleNewBid);
-      getSocket().off("auction:update", handleParticipantUpdate);
+      if (socket.connected && product.id) {
+        socket.emit("auction:leave", product.id, (response) => {
+          console.log("Left auction room:", response);
+        });
+      }
+      
+      // Remove all event listeners
+      socket.off("auction:bid", handleNewBid);
+      socket.off("auction:update", handleParticipantUpdate);
+      socket.off("auction:status", handleAuctionStatus);
     };
-  }, [product?.id]); // Only depend on product.id, not the entire product object
+  }, [product?.id, toast]); // Only depend on product.id and toast, not the entire product object
   
   // Update time left for auction - only set up once when product loads
   useEffect(() => {
@@ -429,106 +594,168 @@ const LiveBidding = () => {
   }, [product?.endBidTime]);
   
   const handlePlaceBid = async () => {
-    if (!product || !bidAmount || !isAuthenticated || !user) return;
+    if (!product || !id || !bidAmount) return;
     
-    // Check if bid is high enough
-    if (bidAmount <= (product.currentBid || product.startingBid || 0)) {
+    if (!isAuthenticated) {
       toast({
-        title: "Bid too low",
-        description: `Your bid must be higher than $${(product.currentBid || product.startingBid || 0).toFixed(2)}`,
+        title: "Authentication Required",
+        description: "You must be logged in to place bids",
         variant: "destructive",
       });
       return;
     }
     
-    setIsPlacingBid(true);
+    if (isAuctionEnded) {
+      toast({
+        title: "Auction Ended",
+        description: "This auction has already ended",
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    // Validate bid amount
+    const minBid = (product.currentBid || product.startingBid || 0) + 0.5;
+    if (bidAmount < minBid) {
+      toast({
+        title: "Invalid Bid",
+        description: `Your bid must be at least $${minBid.toFixed(2)}`,
+        variant: "destructive",
+      });
+      return;
+    }
     
     try {
-      console.log('LiveBidding: Placing bid:', {
-        auctionId: product.id,
+      setIsPlacingBid(true);
+      
+      // Add the bid to history immediately so UI feels responsive
+      const newBid = {
         amount: bidAmount,
-        userId: user.id || user._id
+        bidder: user?.name || 'You',
+        timestamp: new Date()
+      };
+      
+      // Update the UI optimistically
+      setProduct(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          currentBid: bidAmount,
+          bidder: user
+        };
       });
       
-      // Use socket for real-time bidding
-      getSocket().emit("auction:bid", {
-        auctionId: product.id,
-        amount: bidAmount,
-        userId: user.id || user._id
-      }, (response) => {
-        console.log("Bid response:", response);
+      setBidHistory(prev => [newBid, ...prev]);
+      
+      // Attempt to place the bid
+      console.log(`LiveBidding: Placing bid of $${bidAmount} on product ${id}`);
+      
+      // Clear any existing errors
+      setError(null);
+      
+      // Attempt the bid through MarketplaceContext
+      const result = await placeBid(id, bidAmount);
+      
+      if (result) {
+        console.log('LiveBidding: Bid placed successfully:', result);
         
-        // Handle bid response
-        if (response && response.success) {
-          // Bid will be reflected via socket event
-          toast({
-            title: "Bid Placed!",
-            description: `You successfully bid $${bidAmount.toFixed(2)}`,
-          });
-        } else {
-          toast({
-            title: "Bid Failed",
-            description: response?.error || "Failed to place your bid. Please try again.",
-            variant: "destructive",
-          });
+        // Show success toast
+        toast({
+          title: "Bid Placed!",
+          description: `Your bid of $${bidAmount.toFixed(2)} was placed successfully`,
+        });
+        
+        // Update product data from result
+        setProduct(result);
+        productRef.current = result;
+        
+        // Set next minimum bid
+        setBidAmount(bidAmount + 0.5);
+      } else {
+        console.error('LiveBidding: Bid placement failed with no result');
+        
+        // If the bid failed through the API, roll back our optimistic UI updates
+        if (product) {
+          setProduct(product);
+          
+          // Remove the optimistically added bid from history
+          setBidHistory(prev => prev.filter((bid, index) => index > 0));
         }
         
-        setIsPlacingBid(false);
-      });
-    } catch (error) {
-      console.error("Error placing bid:", error);
-      
-      if (isMounted.current) {
         toast({
           title: "Bid Failed",
-          description: "Failed to place your bid. Please try again.",
+          description: "There was an error placing your bid. Please try again.",
           variant: "destructive",
         });
-        setIsPlacingBid(false);
       }
+    } catch (error) {
+      console.error('LiveBidding: Error placing bid:', error);
+      
+      // Log detailed error information
+      if (error instanceof Error) {
+        console.error('Bid error details:', error.message, error.stack);
+      }
+      
+      // Roll back optimistic UI updates on error
+      if (product) {
+        setProduct(product);
+        
+        // Remove the optimistically added bid from history
+        setBidHistory(prev => prev.filter((bid, index) => index > 0));
+      }
+      
+      toast({
+        title: "Bid Failed",
+        description: error instanceof Error ? error.message : "There was an error placing your bid",
+        variant: "destructive",
+      });
+      
+      // Check socket connection on error
+      if (!socketConnected) {
+        console.log('LiveBidding: Socket not connected during bid error, attempting to reconnect');
+        reconnectSocket();
+      }
+    } finally {
+      setIsPlacingBid(false);
     }
   };
   
-  // Add a manual reconnect function
+  // Add a modified reconnect function
   const reconnectSocket = useCallback(() => {
+    if (reconnecting) return; // Don't attempt multiple reconnections at once
+    
     setReconnecting(true);
     setSocketError('Attempting to reconnect...');
     
-    // Close and recreate socket
-    const socket = getSocket();
-    if (socket) {
-      socket.close();
-    }
+    // Close existing socket completely
+    closeSocket();
     
-    createSocket();
-    const newSocket = getSocket();
+    // Create a new socket with modified settings for more reliable connection
+    const newSocket = createSocket();
     
-    // Check if reconnection was successful
-    if (newSocket && newSocket.connected) {
-      setSocketConnected(true);
-      setSocketError(null);
-      setReconnecting(false);
+    // Give time for the socket to connect
+    setTimeout(() => {
+      if (!isMounted.current) return;
       
-      // Rejoin auction room
-      if (id) {
-        newSocket.emit("auction:join", id);
-      }
-    } else {
-      // Schedule another check
-      setTimeout(() => {
-        if (isMounted.current) {
-          const connected = checkConnection();
-          setSocketConnected(connected);
-          setReconnecting(false);
-          if (connected) {
-            setSocketError(null);
-          } else {
-            setSocketError('Failed to reconnect. Please try again.');
-          }
+      if (newSocket.connected) {
+        console.log('LiveBidding: Socket reconnected successfully');
+        setSocketConnected(true);
+        setSocketError(null);
+        setReconnecting(false);
+        
+        // Rejoin auction room
+        if (id) {
+          newSocket.emit("auction:join", id, (response) => {
+            console.log("Rejoined auction room after manual reconnect:", response);
+          });
         }
-      }, 2000);
-    }
-  }, [id]);
+      } else {
+        console.log('LiveBidding: Socket still not connected after reconnect attempt');
+        setSocketError('Failed to reconnect. Please refresh the page.');
+        setReconnecting(false);
+      }
+    }, 3000);
+  }, [id, reconnecting]);
   
   // Return loading state
   if (isLoading) {

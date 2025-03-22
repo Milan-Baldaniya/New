@@ -233,15 +233,36 @@ export const productService = {
   // Place a bid on an auction product
   placeBid: async (productId: string, bidAmount: number): Promise<Product | null> => {
     try {
-      const response = await api.post(`/products/${productId}/bid`, { bidAmount }, true);
+      console.log(`[ProductService] Placing bid of ${bidAmount} on product ${productId}`);
       
-      if (response.success && response.data) {
-        return transformProduct(response.data);
+      // Validate inputs before making the API call
+      if (!productId) {
+        throw new Error('Product ID is required');
       }
       
-      return null;
+      if (!bidAmount || bidAmount <= 0) {
+        throw new Error('Bid amount must be greater than zero');
+      }
+      
+      // Make the API call with better error handling
+      const response = await api.post(
+        `/products/${productId}/bid`, 
+        { bidAmount: bidAmount }, 
+        true // Requires authentication
+      );
+      
+      console.log(`[ProductService] Bid API response:`, response);
+      
+      if (response.success && response.data) {
+        const transformedProduct = transformProduct(response.data);
+        console.log(`[ProductService] Bid successful, updated product:`, transformedProduct);
+        return transformedProduct;
+      } else {
+        console.error(`[ProductService] Bid API returned success=false:`, response);
+        throw new Error(response.error || 'Failed to place bid');
+      }
     } catch (error) {
-      console.error(`Error placing bid on product with ID ${productId}:`, error);
+      console.error(`[ProductService] Error placing bid on product ${productId}:`, error);
       throw error;
     }
   }
