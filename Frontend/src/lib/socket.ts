@@ -287,6 +287,52 @@ export function onBid(handler: (data: any) => void): () => void {
 }
 
 /**
+ * Get the latest bid for an auction
+ * @param {string} auctionId - Auction ID
+ * @returns {Promise<object>} Promise resolving to latest bid data
+ */
+export function getLatestBid(auctionId: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const socketInstance = getSocket();
+    if (DEBUG_MODE) console.log(`[Socket] Getting latest bid for auction: ${auctionId}`);
+    
+    socketInstance.emit('auction:getLatestBid', { auctionId }, (response: any) => {
+      if (response && response.success) {
+        if (DEBUG_MODE) console.log(`[Socket] Received latest bid for auction ${auctionId}:`, response.bid);
+        resolve(response);
+      } else {
+        const error = response?.error || 'Failed to get latest bid';
+        console.error(`[Socket] Error getting latest bid: ${error}`);
+        reject(new Error(error));
+      }
+    });
+  });
+}
+
+/**
+ * Get the current state of an auction including product and bid history
+ * @param {string} auctionId - Auction ID
+ * @returns {Promise<object>} Promise resolving to auction state data
+ */
+export function getAuctionState(auctionId: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const socketInstance = getSocket();
+    if (DEBUG_MODE) console.log(`[Socket] Getting state for auction: ${auctionId}`);
+    
+    socketInstance.emit('auction:getState', { auctionId }, (response: any) => {
+      if (response && response.success) {
+        if (DEBUG_MODE) console.log(`[Socket] Received state for auction ${auctionId}:`, response);
+        resolve(response);
+      } else {
+        const error = response?.error || 'Failed to get auction state';
+        console.error(`[Socket] Error getting auction state: ${error}`);
+        reject(new Error(error));
+      }
+    });
+  });
+}
+
+/**
  * Check and fix socket connection if needed
  * @returns {boolean} True if connection is now active, false otherwise
  */
@@ -368,5 +414,7 @@ export default {
   placeBid,
   onAuctionUpdate,
   onBid,
-  checkConnection
+  checkConnection,
+  getLatestBid,
+  getAuctionState
 }; 

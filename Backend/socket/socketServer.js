@@ -1,6 +1,12 @@
 const { Server } = require('socket.io');
 const logger = require('./socketLogger');
 
+// Add DB models import
+const Auction = require('../models/Auction');
+const Bid = require('../models/Bid');
+// Add auctionService import
+const auctionService = require('../services/auctionService');
+
 /**
  * Configures and initializes a Socket.io server
  * @param {Object} httpServer - HTTP server instance to attach Socket.io to
@@ -26,6 +32,9 @@ function createSocketServer(httpServer, options = {}) {
   const connectedUsers = new Map();
   const auctionRooms = new Map();
   
+  // Store for auction data (bids, product state) - Used as a cache for fast responses
+  const auctionData = new Map();
+  
   // Set up connection handler
   io.on('connection', (socket) => {
     const socketId = socket.id;
@@ -47,7 +56,7 @@ function createSocketServer(httpServer, options = {}) {
     });
     
     // Handle joining auction room
-    socket.on('auction:join', (auctionId, callback) => {
+    socket.on('auction:join', async (auctionId, callback) => {
       const roomId = `auction:${auctionId}`;
       logger.info(`Client ${socketId} joining auction: ${auctionId}`);
       
@@ -67,6 +76,44 @@ function createSocketServer(httpServer, options = {}) {
       
       auctionRooms.get(auctionId).add(socketId);
       const participantCount = auctionRooms.get(auctionId).size;
+      
+      try {
+        // Check if auction exists or needs migration from Product
+        await auctionService.migrateProductToAuction(auctionId)
+          .catch(error => {
+            // If migration fails, it's likely not an auction product
+            logger.warn(`Failed to migrate product to auction: ${error.message}`);
+          });
+        
+        // Update participant count in database
+        await Auction.findByIdAndUpdate(auctionId, {
+          $set: { participants: participantCount }
+        }).catch(error => {
+          logger.warn(`Failed to update participant count: ${error.message}`);
+        });
+        
+        // Update in-memory cache
+        if (!auctionData.has(auctionId)) {
+          // Get auction data
+          const { auction, bids } = await auctionService.getAuctionWithBids(auctionId)
+            .catch(() => ({ auction: null, bids: [] }));
+          
+          if (auction) {
+            auctionData.set(auctionId, {
+              currentBid: auction.currentBid || null,
+              bidder: auction.currentBidder || null,
+              lastUpdated: auction.lastBidTime || null,
+              bidHistory: bids.map(bid => ({
+                amount: bid.amount,
+                bidder: bid.bidderName || 'Anonymous',
+                timestamp: bid.timestamp
+              }))
+            });
+          }
+        }
+      } catch (error) {
+        logger.error(`Error initializing auction data: ${error.message}`);
+      }
       
       // Notify all room participants
       io.to(roomId).emit('auction:update', {
@@ -88,7 +135,7 @@ function createSocketServer(httpServer, options = {}) {
     });
     
     // Handle leaving auction room
-    socket.on('auction:leave', (auctionId, callback) => {
+    socket.on('auction:leave', async (auctionId, callback) => {
       const roomId = `auction:${auctionId}`;
       logger.info(`Client ${socketId} leaving auction: ${auctionId}`);
       
@@ -105,9 +152,21 @@ function createSocketServer(httpServer, options = {}) {
         
         const participantCount = auctionRooms.get(auctionId).size;
         
+        // Update participant count in database
+        try {
+          await Auction.findByIdAndUpdate(auctionId, {
+            $set: { participants: participantCount }
+          }).catch(error => {
+            logger.warn(`Failed to update participant count: ${error.message}`);
+          });
+        } catch (error) {
+          logger.error(`Error updating participant count: ${error.message}`);
+        }
+        
         // Clean up empty rooms
         if (participantCount === 0) {
           auctionRooms.delete(auctionId);
+          // Keep auction data for a while in case participants rejoin
           logger.debug(`Auction room ${auctionId} closed (no participants)`);
         } else {
           // Notify remaining participants
@@ -128,9 +187,176 @@ function createSocketServer(httpServer, options = {}) {
       }
     });
     
+    // Handle auction status check
+    socket.on('auction:status', async (data, callback) => {
+      const { auctionId } = data;
+      logger.info(`Checking auction status: ${auctionId} by client ${socketId}`);
+      
+      try {
+        // Get auction and check if it has ended
+        const { auction } = await auctionService.getAuctionWithBids(auctionId);
+        const isEnded = auction ? auction.hasEnded() : false;
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: true,
+            auctionId,
+            isEnded,
+            status: auction ? auction.status : 'unknown',
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (error) {
+        logger.error(`Error checking auction status: ${error.message}`);
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: false,
+            error: 'Failed to check auction status',
+            auctionId
+          });
+        }
+      }
+    });
+    
+    // Handle getting auction state
+    socket.on('auction:getState', async (data, callback) => {
+      const { auctionId } = data;
+      logger.info(`Getting auction state: ${auctionId} by client ${socketId}`);
+      
+      try {
+        // Get auction with bids from service
+        const { auction, bids } = await auctionService.getAuctionWithBids(auctionId);
+        
+        // Format bid history for client
+        const bidHistory = bids.map(bid => ({
+          amount: bid.amount,
+          bidder: bid.bidderName || 'Anonymous',
+          timestamp: bid.timestamp
+        }));
+        
+        // Update in-memory cache
+        auctionData.set(auctionId, {
+          currentBid: auction.currentBid || null,
+          bidder: auction.currentBidder || null,
+          lastUpdated: auction.lastBidTime || null,
+          bidHistory
+        });
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: true,
+            auctionId,
+            product: {
+              id: auction._id,
+              name: auction.name,
+              currentBid: auction.currentBid,
+              bidder: auction.currentBidder,
+              startingBid: auction.startingBid,
+              endBidTime: auction.endBidTime,
+              status: auction.status
+            },
+            bidHistory,
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (error) {
+        logger.error(`Error getting auction state from database: ${error.message}`);
+        
+        // Fall back to in-memory data if database query fails
+        const state = auctionData.get(auctionId) || {
+          currentBid: null,
+          bidder: null,
+          lastUpdated: null,
+          bidHistory: []
+        };
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: true,
+            auctionId,
+            product: {
+              id: auctionId,
+              currentBid: state.currentBid,
+              bidder: state.bidder
+            },
+            bidHistory: state.bidHistory,
+            timestamp: new Date().toISOString()
+          });
+        }
+      }
+    });
+    
+    // Handle getting latest bid
+    socket.on('auction:getLatestBid', async (data, callback) => {
+      const { auctionId } = data;
+      logger.info(`Getting latest bid: ${auctionId} by client ${socketId}`);
+      
+      try {
+        // Get latest bid from service
+        const latestBid = await auctionService.getLatestBid(auctionId);
+        
+        let bidData = null;
+        
+        if (latestBid) {
+          bidData = {
+            auctionId,
+            amount: latestBid.amount,
+            bidder: latestBid.bidderName || 'Anonymous',
+            userId: latestBid.bidder,
+            timestamp: latestBid.timestamp
+          };
+        } else {
+          // Fall back to in-memory data if no bids in database
+          const state = auctionData.get(auctionId);
+          if (state && state.currentBid !== null) {
+            bidData = {
+              auctionId,
+              amount: state.currentBid,
+              bidder: state.bidder,
+              timestamp: state.lastUpdated
+            };
+          }
+        }
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: true,
+            auctionId,
+            bid: bidData,
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (error) {
+        logger.error(`Error getting latest bid from database: ${error.message}`);
+        
+        // Fall back to in-memory data
+        const state = auctionData.get(auctionId);
+        let latestBid = null;
+        
+        if (state && state.currentBid !== null) {
+          latestBid = {
+            auctionId,
+            amount: state.currentBid,
+            bidder: state.bidder,
+            timestamp: state.lastUpdated
+          };
+        }
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: true,
+            auctionId,
+            bid: latestBid,
+            timestamp: new Date().toISOString()
+          });
+        }
+      }
+    });
+    
     // Handle bid placement
-    socket.on('auction:bid', (data, callback) => {
-      const { auctionId, amount, userId } = data;
+    socket.on('auction:bid', async (data, callback) => {
+      const { auctionId, amount, userId, bidder, timestamp } = data;
       
       if (!auctionId || !amount || !userId) {
         logger.warn(`Invalid bid data from ${socketId}: ${JSON.stringify(data)}`);
@@ -145,23 +371,68 @@ function createSocketServer(httpServer, options = {}) {
       
       logger.info(`New bid: ${auctionId}, $${amount} by user ${userId}`);
       
-      // Broadcast bid to auction room
-      const roomId = `auction:${auctionId}`;
-      io.to(roomId).emit('auction:bid', {
-        auctionId,
-        amount,
-        userId,
-        bidder: socketId,
-        timestamp: new Date().toISOString()
-      });
-      
-      if (typeof callback === 'function') {
-        callback({
-          success: true,
+      try {
+        // Use service to place bid
+        const bidderName = typeof bidder === 'object' ? bidder.name : 'Anonymous';
+        const { bid, auction } = await auctionService.placeBid(auctionId, amount, userId, bidderName);
+        
+        // Create response data
+        const bidData = {
           auctionId,
           amount,
-          timestamp: new Date().toISOString()
-        });
+          userId,
+          bidder: bidder || userId,
+          timestamp: timestamp || new Date().toISOString()
+        };
+        
+        // Update in-memory cache
+        if (!auctionData.has(auctionId)) {
+          auctionData.set(auctionId, {
+            currentBid: amount,
+            bidder: bidder || userId,
+            lastUpdated: timestamp || new Date().toISOString(),
+            bidHistory: []
+          });
+        } else {
+          const auctionCache = auctionData.get(auctionId);
+          
+          // Update with new bid
+          auctionCache.currentBid = amount;
+          auctionCache.bidder = bidder || userId;
+          auctionCache.lastUpdated = timestamp || new Date().toISOString();
+          
+          // Add to bid history
+          auctionCache.bidHistory.unshift({
+            amount,
+            bidder: bidderName,
+            timestamp: timestamp || new Date().toISOString()
+          });
+          
+          // Keep history manageable
+          if (auctionCache.bidHistory.length > 50) {
+            auctionCache.bidHistory = auctionCache.bidHistory.slice(0, 50);
+          }
+        }
+        
+        // Broadcast bid to auction room
+        const roomId = `auction:${auctionId}`;
+        io.to(roomId).emit('auction:bid', bidData);
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: true,
+            ...bidData
+          });
+        }
+      } catch (error) {
+        logger.error(`Error saving bid to database: ${error.message}`);
+        
+        if (typeof callback === 'function') {
+          callback({
+            success: false,
+            error: error.message || 'Failed to save bid'
+          });
+        }
       }
     });
     
@@ -185,6 +456,13 @@ function createSocketServer(httpServer, options = {}) {
           auctionRooms.get(auctionId).delete(socketId);
           const participantCount = auctionRooms.get(auctionId).size;
           
+          // Update participant count in database
+          Auction.findByIdAndUpdate(auctionId, {
+            $set: { participants: participantCount }
+          }).catch(error => {
+            logger.warn(`Failed to update participant count: ${error.message}`);
+          });
+          
           if (participantCount === 0) {
             auctionRooms.delete(auctionId);
             logger.debug(`Auction room ${auctionId} closed (no participants)`);
@@ -202,6 +480,18 @@ function createSocketServer(httpServer, options = {}) {
     });
   });
   
+  // Set up periodic task to close ended auctions
+  const auctionCleanupInterval = setInterval(async () => {
+    try {
+      const closedCount = await auctionService.closeEndedAuctions();
+      if (closedCount > 0) {
+        logger.info(`Closed ${closedCount} ended auctions`);
+      }
+    } catch (error) {
+      logger.error(`Error in auction cleanup: ${error.message}`);
+    }
+  }, 60000); // Check every minute
+  
   // Add helper methods for server management/stats
   io.getStats = () => {
     return {
@@ -216,7 +506,8 @@ function createSocketServer(httpServer, options = {}) {
       auctions: Array.from(auctionRooms.entries()).map(([auctionId, participants]) => ({
         id: auctionId,
         participants: Array.from(participants),
-        count: participants.size
+        count: participants.size,
+        latestBid: auctionData.get(auctionId)?.currentBid || null
       })),
       server: {
         uptime: process.uptime(),
@@ -226,6 +517,16 @@ function createSocketServer(httpServer, options = {}) {
   };
   
   logger.info('Socket.io server initialized');
+  
+  // Clean up on server shutdown
+  const cleanup = () => {
+    clearInterval(auctionCleanupInterval);
+    logger.info('Socket server shutting down, cleanup completed');
+  };
+  
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+  
   return io;
 }
 

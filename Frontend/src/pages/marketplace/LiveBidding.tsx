@@ -280,32 +280,70 @@ const LiveBidding = () => {
     console.log('LiveBidding: Socket connected status:', getSocket().connected);
     console.log('LiveBidding: Socket ID:', getSocket().id);
     
+    // Ensure socket is created and connected
+    const socket = getSocket();
+    if (!socket.connected) {
+      console.log('LiveBidding: Socket not connected, attempting to connect');
+      socket.connect();
+    }
+    
     // Join the auction room
-    getSocket().emit("auction:join", product.id, (response) => {
+    socket.emit("auction:join", product.id, (response) => {
       console.log("Joined auction room:", response);
       // Update participant count on successful join
       if (response && response.success) {
         setParticipants(response.participantCount);
+        
+        // Explicitly emit a request for current auction state
+        socket.emit("auction:getState", { auctionId: product.id }, (stateResponse: any) => {
+          console.log("Received auction state:", stateResponse);
+          if (stateResponse && stateResponse.success) {
+            // Update with the latest product state from the server
+            if (stateResponse.product) {
+              setProduct(stateResponse.product);
+              productRef.current = stateResponse.product;
+              
+              // Update bid amount based on current state
+              const minimumNextBid = (stateResponse.product.currentBid || stateResponse.product.startingBid || 0) + 0.5;
+              setBidAmount(minimumNextBid);
+            }
+            
+            // Update bid history if provided
+            if (stateResponse.bidHistory && stateResponse.bidHistory.length > 0) {
+              setBidHistory(stateResponse.bidHistory);
+            }
+          }
+        });
       }
     });
     
     // Confirm connection status
-    console.log(`LiveBidding: Socket connected: ${getSocket().connected ? 'Yes' : 'No'}, ID: ${getSocket().id}`);
+    console.log(`LiveBidding: Socket connected: ${socket.connected ? 'Yes' : 'No'}, ID: ${socket.id}`);
     
     // Listen for new bids
     const handleNewBid = (data: any) => {
       console.log(`LiveBidding: Received new bid:`, data);
       if (!isMounted.current) return;
       
+      // Check if this bid is for our auction
+      if (data.auctionId !== product.id) {
+        console.log(`LiveBidding: Ignoring bid for different auction: ${data.auctionId}`);
+        return;
+      }
+      
       // Update product with new bid
       setProduct(prevProduct => {
         if (!prevProduct) return null;
         
-        return {
+        // Also update the productRef to ensure timer calculations use latest data
+        const updatedProduct = {
           ...prevProduct,
           currentBid: data.amount,
           bidder: data.bidder
         };
+        productRef.current = updatedProduct;
+        
+        return updatedProduct;
       });
       
       // Update bid history
@@ -313,7 +351,7 @@ const LiveBidding = () => {
         {
           amount: data.amount,
           bidder: typeof data.bidder === 'object' ? data.bidder.name : 'Anonymous',
-          timestamp: new Date(data.timestamp)
+          timestamp: new Date(data.timestamp || Date.now())
         },
         ...prev
       ]);
@@ -336,17 +374,35 @@ const LiveBidding = () => {
       }
     };
     
-    getSocket().on("auction:bid", handleNewBid);
-    getSocket().on("auction:update", handleParticipantUpdate);
+    socket.on("auction:bid", handleNewBid);
+    socket.on("auction:update", handleParticipantUpdate);
+    
+    // Add a periodic check for missed bids
+    const bidCheckInterval = setInterval(() => {
+      if (isMounted.current && socket.connected) {
+        console.log('LiveBidding: Checking for missed bids');
+        socket.emit("auction:getLatestBid", { auctionId: product.id }, (response: any) => {
+          if (response && response.success && response.bid) {
+            const currentBid = productRef.current?.currentBid || 0;
+            // If server has a higher bid than we do, update our state
+            if (response.bid.amount > currentBid) {
+              console.log(`LiveBidding: Detected missed bid update: ${response.bid.amount} vs our ${currentBid}`);
+              handleNewBid(response.bid);
+            }
+          }
+        });
+      }
+    }, 10000); // Check every 10 seconds
     
     return () => {
       console.log('LiveBidding: Cleaning up socket connections');
       // Leave the auction room
-      getSocket().emit("auction:leave", product.id, (response) => {
+      socket.emit("auction:leave", product.id, (response) => {
         console.log("Left auction room:", response);
       });
-      getSocket().off("auction:bid", handleNewBid);
-      getSocket().off("auction:update", handleParticipantUpdate);
+      socket.off("auction:bid", handleNewBid);
+      socket.off("auction:update", handleParticipantUpdate);
+      clearInterval(bidCheckInterval);
     };
   }, [product?.id]); // Only depend on product.id, not the entire product object
   
@@ -428,11 +484,81 @@ const LiveBidding = () => {
     }
   }, [product?.endBidTime]);
   
+  // Add a manual reconnect function for socket connection issues
+  const reconnectSocket = useCallback(() => {
+    setReconnecting(true);
+    setSocketError('Attempting to reconnect...');
+    
+    console.log("[DEBUG] Starting socket reconnection process");
+    
+    // Close and recreate socket
+    const socket = getSocket();
+    if (socket) {
+      console.log("[DEBUG] Closing existing socket connection");
+      socket.close();
+    }
+    
+    console.log("[DEBUG] Creating new socket connection");
+    createSocket();
+    const newSocket = getSocket();
+    console.log("[DEBUG] New socket created, connected:", newSocket.connected);
+    
+    // Check if reconnection was successful
+    if (newSocket && newSocket.connected) {
+      console.log("[DEBUG] Socket reconnected successfully");
+      setSocketConnected(true);
+      setSocketError(null);
+      setReconnecting(false);
+      
+      // Rejoin auction room
+      if (id) {
+        console.log("[DEBUG] Rejoining auction room:", id);
+        newSocket.emit("auction:join", id, (response) => {
+          console.log("[DEBUG] Rejoined auction room response:", response);
+        });
+      }
+    } else {
+      console.log("[DEBUG] Socket reconnection not immediately successful, scheduling check");
+      // Schedule another check
+      setTimeout(() => {
+        if (isMounted.current) {
+          console.log("[DEBUG] Checking connection status after delay");
+          const connected = checkConnection();
+          console.log("[DEBUG] Connection check result:", connected);
+          setSocketConnected(connected);
+          setReconnecting(false);
+          if (connected) {
+            setSocketError(null);
+            
+            // If reconnected, make sure we're in the auction room
+            if (id) {
+              console.log("[DEBUG] Rejoining auction room after delayed reconnect:", id);
+              getSocket().emit("auction:join", id, (response) => {
+                console.log("[DEBUG] Rejoined auction room response:", response);
+              });
+            }
+          } else {
+            setSocketError('Failed to reconnect. Please try again.');
+          }
+        }
+      }, 2000);
+    }
+  }, [id]);
+  
   const handlePlaceBid = async () => {
-    if (!product || !bidAmount || !isAuthenticated || !user) return;
+    if (!product || !bidAmount || !isAuthenticated || !user) {
+      console.log("[DEBUG] Bid validation failed:", {
+        hasProduct: !!product,
+        hasBidAmount: !!bidAmount,
+        isAuthenticated,
+        hasUser: !!user
+      });
+      return;
+    }
     
     // Check if bid is high enough
     if (bidAmount <= (product.currentBid || product.startingBid || 0)) {
+      console.log("[DEBUG] Bid too low:", bidAmount, "current:", product.currentBid || product.startingBid || 0);
       toast({
         title: "Bid too low",
         description: `Your bid must be higher than $${(product.currentBid || product.startingBid || 0).toFixed(2)}`,
@@ -441,31 +567,118 @@ const LiveBidding = () => {
       return;
     }
     
+    // Check if the auction has ended
+    if (isAuctionEnded) {
+      console.log("[DEBUG] Attempted to bid on ended auction");
+      toast({
+        title: "Auction Ended",
+        description: "This auction has ended and no more bids can be placed.",
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    console.log("[DEBUG] Starting bid process, amount:", bidAmount);
     setIsPlacingBid(true);
     
     try {
-      console.log('LiveBidding: Placing bid:', {
-        auctionId: product.id,
-        amount: bidAmount,
-        userId: user.id || user._id
+      const socket = getSocket();
+      console.log("[DEBUG] Socket status before bid:", {
+        connected: socket.connected,
+        id: socket.id,
+        url: socket.io.uri
       });
       
-      // Use socket for real-time bidding
-      getSocket().emit("auction:bid", {
+      // Ensure socket is connected before attempting to place bid
+      if (!socket.connected) {
+        console.log('[DEBUG] Socket disconnected, attempting to reconnect before bidding');
+        socket.connect();
+        
+        // Wait for connection or timeout
+        let connectionTimeout = 0;
+        while (!socket.connected && connectionTimeout < 5) {
+          console.log("[DEBUG] Waiting for socket to connect, attempt:", connectionTimeout + 1);
+          await new Promise(resolve => setTimeout(resolve, 500));
+          connectionTimeout++;
+        }
+        
+        if (!socket.connected) {
+          console.log("[DEBUG] Failed to connect socket after multiple attempts");
+          throw new Error("Unable to connect to bidding server");
+        }
+        
+        console.log("[DEBUG] Socket reconnected successfully");
+      }
+      
+      const bidData = {
         auctionId: product.id,
         amount: bidAmount,
-        userId: user.id || user._id
-      }, (response) => {
-        console.log("Bid response:", response);
+        userId: user.id || user._id,
+        bidder: {
+          id: user.id || user._id,
+          name: user.name || "Anonymous",
+          email: user.email
+        },
+        timestamp: new Date().toISOString()
+      };
+      
+      console.log('[DEBUG] Placing bid:', bidData);
+      
+      // Use socket for real-time bidding
+      socket.emit("auction:bid", bidData, (response) => {
+        console.log("[DEBUG] Bid response received:", response);
         
         // Handle bid response
         if (response && response.success) {
+          console.log("[DEBUG] Bid successful, updating local state");
           // Bid will be reflected via socket event
           toast({
             title: "Bid Placed!",
             description: `You successfully bid $${bidAmount.toFixed(2)}`,
           });
+          
+          // Update local state immediately rather than waiting for the broadcast
+          // This ensures the bidder sees their bid right away
+          setProduct(prevProduct => {
+            if (!prevProduct) return null;
+            
+            const updatedProduct = {
+              ...prevProduct,
+              currentBid: bidAmount,
+              bidder: user
+            };
+            productRef.current = updatedProduct;
+            
+            return updatedProduct;
+          });
+          
+          // Add to bid history
+          setBidHistory(prev => [
+            {
+              amount: bidAmount,
+              bidder: user.name || "You",
+              timestamp: new Date()
+            },
+            ...prev
+          ]);
+          
+          // Verify broadcast by explicitly requesting latest bid after a short delay
+          setTimeout(() => {
+            console.log("[DEBUG] Verifying bid broadcast");
+            socket.emit("auction:getLatestBid", { auctionId: product.id }, (verifyResponse: any) => {
+              console.log("[DEBUG] Verification response:", verifyResponse);
+              if (verifyResponse?.success && verifyResponse.bid) {
+                console.log("[DEBUG] Latest bid on server:", verifyResponse.bid);
+                if (verifyResponse.bid.amount !== bidAmount) {
+                  console.log("[DEBUG] Server bid amount differs from our bid, may indicate broadcast issue");
+                }
+              } else {
+                console.log("[DEBUG] Failed to verify latest bid");
+              }
+            });
+          }, 1000);
         } else {
+          console.log("[DEBUG] Bid failed:", response?.error || "Unknown error");
           toast({
             title: "Bid Failed",
             description: response?.error || "Failed to place your bid. Please try again.",
@@ -476,59 +689,18 @@ const LiveBidding = () => {
         setIsPlacingBid(false);
       });
     } catch (error) {
-      console.error("Error placing bid:", error);
+      console.error("[DEBUG] Error placing bid:", error);
       
       if (isMounted.current) {
         toast({
           title: "Bid Failed",
-          description: "Failed to place your bid. Please try again.",
+          description: error instanceof Error ? error.message : "Failed to place your bid. Please try again.",
           variant: "destructive",
         });
         setIsPlacingBid(false);
       }
     }
   };
-  
-  // Add a manual reconnect function
-  const reconnectSocket = useCallback(() => {
-    setReconnecting(true);
-    setSocketError('Attempting to reconnect...');
-    
-    // Close and recreate socket
-    const socket = getSocket();
-    if (socket) {
-      socket.close();
-    }
-    
-    createSocket();
-    const newSocket = getSocket();
-    
-    // Check if reconnection was successful
-    if (newSocket && newSocket.connected) {
-      setSocketConnected(true);
-      setSocketError(null);
-      setReconnecting(false);
-      
-      // Rejoin auction room
-      if (id) {
-        newSocket.emit("auction:join", id);
-      }
-    } else {
-      // Schedule another check
-      setTimeout(() => {
-        if (isMounted.current) {
-          const connected = checkConnection();
-          setSocketConnected(connected);
-          setReconnecting(false);
-          if (connected) {
-            setSocketError(null);
-          } else {
-            setSocketError('Failed to reconnect. Please try again.');
-          }
-        }
-      }, 2000);
-    }
-  }, [id]);
   
   // Return loading state
   if (isLoading) {
