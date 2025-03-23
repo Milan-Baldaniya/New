@@ -17,9 +17,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { Clock, Gavel, Users, UserCheck, ArrowRight, AlertCircle, Bell, DollarSign, TrendingUp, RefreshCw } from "lucide-react";
-import { Product } from "@/services/productService";
-import { getSocket } from "@/lib/socket";
+import { Product, productService } from "@/services/productService";
+import { getSocket, emitBid } from "@/lib/socket";
 import { AnimatePresence, motion } from "framer-motion";
+import { formatCurrency } from "@/lib/utils";
 
 const LiveBidding = () => {
   const navigate = useNavigate();
@@ -278,20 +279,31 @@ const LiveBidding = () => {
       console.log('Received bid event:', data);
       const { auctionId, amount, bidder, timestamp } = data;
       
+      if (!auctionId || !amount) {
+        console.warn('Received invalid bid event data:', data);
+        return;
+      }
+      
       // Update live data for the auction
       setLiveData(prev => {
         const auctionData = prev[auctionId] || { participants: 0, recentBids: [] };
         
-        const bidderName = typeof bidder === 'object' ? bidder.name : 
-                          bidder?.name ? bidder.name : 
-                          typeof bidder === 'string' ? bidder : 'Anonymous';
+        // Extract bidder name from different possible data structures
+        const bidderName = typeof bidder === 'object' ? 
+                         (bidder?.name || 'Anonymous') : 
+                         typeof bidder === 'string' ? bidder : 'Anonymous';
+        
+        // Create a timestamp that's definitely a Date object
+        const bidTime = timestamp ? new Date(timestamp) : new Date();
+        
+        console.log(`Processing bid from ${bidderName} for amount ${amount} on auction ${auctionId}`);
         
         return {
           ...prev,
           [auctionId]: {
             ...auctionData,
             recentBids: [
-              { amount, bidder: bidderName, timestamp: new Date(timestamp) },
+              { amount, bidder: bidderName, timestamp: bidTime },
               ...auctionData.recentBids
             ].slice(0, 5) // Keep only the 5 most recent bids
           }
@@ -353,9 +365,9 @@ const LiveBidding = () => {
       // Find product name for the notification
       const product = products.find(p => p.id === auctionId);
       if (product) {
-        const bidderName = typeof bidder === 'object' ? bidder.name : 
-                          bidder?.name ? bidder.name : 
-                          typeof bidder === 'string' ? bidder : 'Anonymous';
+        const bidderName = typeof bidder === 'object' ? 
+                        (bidder?.name || 'Anonymous') : 
+                        typeof bidder === 'string' ? bidder : 'Anonymous';
         
         // Set active notification for animation
         setActiveNotification({
@@ -363,7 +375,7 @@ const LiveBidding = () => {
           productName: product.name,
           bidder: bidderName,
           amount: amount,
-          timestamp: new Date(timestamp),
+          timestamp: new Date(timestamp || new Date()),
           productImage: product.images && product.images.length > 0 ? product.images[0] : undefined
         });
 
@@ -374,7 +386,7 @@ const LiveBidding = () => {
             productName: product.name,
             bidder: bidderName,
             amount: amount,
-            timestamp: new Date(timestamp),
+            timestamp: new Date(timestamp || new Date()),
             seen: false
           },
           ...prev
@@ -394,7 +406,62 @@ const LiveBidding = () => {
       }
     };
 
+    // Remove any existing listener before adding a new one to prevent duplicates
+    socket.off("auction:bid");
     socket.on("auction:bid", handleBid);
+
+    // Also register for stateUpdate events that might contain bid information
+    socket.off("auction:stateUpdate");
+    socket.on("auction:stateUpdate", (data) => {
+      console.log('Received auction state update:', data);
+      if (data && data.auctionId && data.product) {
+        // Update product data from the state update
+        const { auctionId, product: updatedProduct, bidHistory } = data;
+        
+        // Update product in our state lists
+        if (updatedProduct && updatedProduct.currentBid) {
+          // Update auction products list
+          setAuctionProducts(prevProducts => 
+            prevProducts.map(product => 
+              product.id === auctionId
+                ? {
+                    ...product,
+                    currentBid: updatedProduct.currentBid,
+                    bidder: updatedProduct.bidder
+                  }
+                : product
+            )
+          );
+          
+          // Update active auctions
+          setActiveAuctions(prev => 
+            prev.map(product => 
+              product.id === auctionId
+                ? {
+                    ...product,
+                    currentBid: updatedProduct.currentBid,
+                    bidder: updatedProduct.bidder
+                  }
+                : product
+            )
+          );
+        }
+        
+        // If we have bid history, update it
+        if (bidHistory && bidHistory.length > 0) {
+          setLiveData(prev => {
+            const auctionData = prev[auctionId] || { participants: 0, recentBids: [] };
+            return {
+              ...prev,
+              [auctionId]: {
+                ...auctionData,
+                recentBids: bidHistory.slice(0, 5)
+              }
+            };
+          });
+        }
+      }
+    });
 
     const handleParticipantUpdate = (data) => {
       console.log('Received participant update:', data);
@@ -414,6 +481,50 @@ const LiveBidding = () => {
 
     socket.on("auction:update", handleParticipantUpdate);
 
+    // Ensure socket connection
+    if (!socket.connected) {
+      console.log('LiveBidding: Socket not connected on mount, connecting...');
+      socket.connect();
+      
+      // After connecting, fetch current state of all auctions
+      setTimeout(() => {
+        if (socket.connected) {
+          console.log('Fetching current state for all active auctions...');
+          activeAuctions.forEach(auction => {
+            socket.emit('auction:getState', { auctionId: auction.id }, (response) => {
+              console.log(`Got state for auction ${auction.id}:`, response);
+              if (response && response.success) {
+                // Process the state data
+                if (response.product && response.product.currentBid) {
+                  // Update product in our lists
+                  setActiveAuctions(prev => 
+                    prev.map(p => p.id === auction.id 
+                      ? { ...p, currentBid: response.product.currentBid, bidder: response.product.bidder }
+                      : p
+                    )
+                  );
+                }
+                
+                // Update bid history
+                if (response.bidHistory && response.bidHistory.length > 0) {
+                  setLiveData(prev => {
+                    const auctionData = prev[auction.id] || { participants: 0, recentBids: [] };
+                    return {
+                      ...prev,
+                      [auction.id]: {
+                        ...auctionData,
+                        recentBids: response.bidHistory.slice(0, 5)
+                      }
+                    };
+                  });
+                }
+              }
+            });
+          });
+        }
+      }, 1000);
+    }
+
     // Setup connection status handler
     const handleConnect = () => {
       console.log('Socket connected event fired');
@@ -423,6 +534,14 @@ const LiveBidding = () => {
         console.log(`Rejoining auction room after reconnect: ${auction.id}`);
         socket.emit("auction:join", { auctionId: auction.id });
         socket.emit("auction:join", auction.id);
+        
+        // After joining, request latest state
+        setTimeout(() => {
+          socket.emit('auction:getState', { auctionId: auction.id }, (response) => {
+            console.log(`Got state after reconnect for auction ${auction.id}:`, response);
+            // Process state data as above
+          });
+        }, 500);
       });
     };
 
@@ -431,7 +550,7 @@ const LiveBidding = () => {
     // Check connection status periodically
     const connectionInterval = setInterval(() => {
       if (!socket.connected) {
-        console.log('Socket disconnected, attempting to reconnect...');
+        console.log('LiveBidding: Socket disconnected, attempting to reconnect...');
         socket.connect();
       }
     }, 15000);
@@ -439,6 +558,7 @@ const LiveBidding = () => {
     return () => {
       socket.off("auction:bid", handleBid);
       socket.off("auction:update", handleParticipantUpdate);
+      socket.off("auction:stateUpdate");
       socket.off('connect', handleConnect);
       clearInterval(connectionInterval);
     };
@@ -461,15 +581,6 @@ const LiveBidding = () => {
     if (days > 0) return `${days}d ${hours}h`;
     if (hours > 0) return `${hours}h ${minutes}m`;
     return `${minutes}m`;
-  };
-
-  // Format currency
-  const formatCurrency = (amount: number | undefined) => {
-    if (amount === undefined) return "N/A";
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD'
-    }).format(amount);
   };
 
   // Navigate to detailed auction view
@@ -818,13 +929,14 @@ const LiveBidding = () => {
     const currentBid = product.currentBid || product.startingBid || 0;
     const bidAmount = currentBid + 0.5;
     
-    // Create test bidder
+    // Create test bidder with complete information
     const testBidder = {
       id: "test-user-" + Math.floor(Math.random() * 1000),
-      name: "Test Bidder " + Math.floor(Math.random() * 100)
+      name: "Test Bidder " + Math.floor(Math.random() * 100),
+      email: "test@example.com"
     };
     
-    // Create bid data
+    // Create comprehensive bid data with all required fields
     const bidData = {
       auctionId: productId,
       amount: bidAmount,
@@ -835,23 +947,68 @@ const LiveBidding = () => {
     
     console.log(`LiveBidding: Simulating test bid:`, bidData);
     
-    // Emit directly
-    socket.emit('auction:bid', bidData, (response: any) => {
-      console.log("Test bid response:", response);
-      
-      if (response && response.success) {
-        toast({
-          title: "Test bid sent",
-          description: `Simulated bid of ${formatCurrency(bidAmount)} on ${product.name}`,
+    // First try API method through MarketplaceContext if possible
+    try {
+      // Call the API directly if possible
+      productService.placeBid(productId, bidAmount)
+        .then(updatedProduct => {
+          console.log("API test bid successful:", updatedProduct);
+          
+          // If API succeeds, toast and socket will be handled automatically
+          toast({
+            title: "Test bid sent via API",
+            description: `Simulated bid of ${formatCurrency(bidAmount)} on ${product.name}`,
+          });
+        })
+        .catch(error => {
+          console.error("API test bid failed:", error);
+          
+          // If API fails, use socket directly
+          emitSocketBid();
         });
-      } else {
-        toast({
-          title: "Test bid failed",
-          description: response?.error || "Unknown error",
-          variant: "destructive"
-        });
-      }
-    });
+    } catch (error) {
+      // If API route failed, use socket directly
+      emitSocketBid();
+    }
+    
+    // Function to emit bid via socket
+    function emitSocketBid() {
+      // Emit directly with callback
+      socket.emit('auction:bid', bidData, (response: any) => {
+        console.log("Test bid response:", response);
+        
+        if (response && response.success) {
+          toast({
+            title: "Test bid sent via socket",
+            description: `Simulated bid of ${formatCurrency(bidAmount)} on ${product.name}`,
+          });
+          
+          // Update product in local state to show the bid immediately
+          setAuctionProducts(prevProducts => 
+            prevProducts.map(p => 
+              p.id === productId
+                ? { ...p, currentBid: bidAmount, bidder: testBidder }
+                : p
+            )
+          );
+          
+          // Update active auctions too
+          setActiveAuctions(prev => 
+            prev.map(p => 
+              p.id === productId
+                ? { ...p, currentBid: bidAmount, bidder: testBidder }
+                : p
+            )
+          );
+        } else {
+          toast({
+            title: "Test bid failed",
+            description: response?.error || "Unknown error",
+            variant: "destructive"
+          });
+        }
+      });
+    }
   };
 
   return (

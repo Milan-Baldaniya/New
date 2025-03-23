@@ -242,6 +242,21 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     try {
       console.log(`Placing bid of $${amount} on product ${productId}`);
       
+      // Get socket and ensure connection before proceeding
+      const socket = getSocket();
+      if (!socket.connected) {
+        console.log("Socket not connected before bid, connecting...");
+        socket.connect();
+        
+        // Short wait to allow connection
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Check if connection was established
+        if (!socket.connected) {
+          console.warn("Socket still not connected after connection attempt");
+        }
+      }
+      
       // Call API first to record the bid in the database
       // This ensures the bid is saved even if socket fails
       try {
@@ -272,71 +287,83 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
           )
         );
         
-        // Force socket connection check before emitting
-        const socket = getSocket();
-        if (!socket.connected) {
-          console.log("Socket not connected before bid, connecting...");
-          socket.connect();
-          
-          // Short wait to allow connection
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
+        // Prepare comprehensive bid data with all necessary fields
+        const bidData = {
+          auctionId: productId,
+          amount: amount,
+          userId: user.id,
+          bidder: {
+            id: user.id,
+            name: user.name || "Anonymous"
+          },
+          timestamp: new Date().toISOString()
+        };
         
-        // Now emit the bid via socket for real-time updates to other users
-        // Even if this fails, our database already has the bid recorded
-        try {
-          console.log(`Emitting socket bid event for ${productId} with amount ${amount}`);
-          
-          // Enhanced bid data with user information
-          const bidData = {
-            auctionId: productId,
-            amount: amount,
-            userId: user.id,
-            bidder: {
-              id: user.id,
-              name: user.name
-            },
-            timestamp: new Date().toISOString()
-          };
-          
-          // Emit directly to ensure it's sent
-          socket.emit('auction:bid', bidData, (response: any) => {
-            console.log("Socket bid direct response:", response);
-          });
-          
-          // Also use the library function as backup
-          const socketResponse = await emitBid(productId, amount, user.id);
-          console.log("Socket bid library response:", socketResponse);
-        } catch (socketError) {
-          console.error("Socket bid error:", socketError);
-          // Continue since API call was successful
-        }
+        // Ensure bid is broadcast via socket for real-time updates
+        // Try multiple methods to increase reliability
         
+        // Method 1: Direct socket emit with callback
+        console.log("Broadcasting bid via direct socket emit:", bidData);
+        socket.emit('auction:bid', bidData, (response: any) => {
+          console.log("Socket bid direct response:", response);
+          
+          // If direct emit fails, try the fallback method
+          if (!response || !response.success) {
+            console.warn("Direct socket emit unsuccessful, trying library method");
+            
+            // Method 2: Use the library function as backup
+            emitBid(productId, amount, user.id)
+              .then(libResponse => console.log("Library method bid response:", libResponse))
+              .catch(err => console.error("Library method bid failed:", err));
+          }
+        });
+        
+        // Return the updated product
         return updatedProduct;
       } catch (apiError) {
         console.error("API bid error:", apiError);
         
         // If API fails but socket is connected, try socket bid as fallback
-        try {
-          console.log("Attempting socket bid as fallback");
-          const socketResponse = await emitBid(productId, amount, user.id);
-          console.log("Fallback socket bid response:", socketResponse);
-          
-          // If socket bid succeeds, return a basic product update
-          // This isn't ideal but prevents a complete failure
-          if (socketResponse && socketResponse.success) {
-            const product = products.find(p => p.id === productId);
-            if (product) {
-              const updatedProduct = {
-                ...product,
-                currentBid: amount,
-                bidder: user
-              };
-              return updatedProduct;
+        if (socket.connected) {
+          try {
+            console.log("Attempting socket bid as fallback after API failure");
+            
+            // Create complete bid data
+            const fallbackBidData = {
+              auctionId: productId,
+              amount: amount,
+              userId: user.id,
+              bidder: {
+                id: user.id,
+                name: user.name || "Anonymous"
+              },
+              timestamp: new Date().toISOString()
+            };
+            
+            // Emit directly with full data
+            socket.emit('auction:bid', fallbackBidData, (response: any) => {
+              console.log("Fallback socket bid response:", response);
+            });
+            
+            // Also try library method
+            const socketResponse = await emitBid(productId, amount, user.id);
+            console.log("Fallback library method response:", socketResponse);
+            
+            // If socket bid succeeds, return a basic product update
+            if (socketResponse && socketResponse.success) {
+              const product = products.find(p => p.id === productId);
+              if (product) {
+                const updatedProduct = {
+                  ...product,
+                  currentBid: amount,
+                  bidder: user
+                };
+                return updatedProduct;
+              }
             }
+          } catch (socketError) {
+            console.error("Fallback socket bid also failed:", socketError);
           }
-        } catch (socketError) {
-          console.error("Fallback socket bid also failed:", socketError);
         }
         
         // Both API and socket failed

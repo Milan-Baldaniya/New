@@ -21,3 +21,8 @@ export function formatCurrency(amount: number | undefined, currency: string = 'U
     maximumFractionDigits: 2
   }).format(amount);
 }
+
+export default {
+  cn,
+  formatCurrency
+};

@@ -19,6 +19,7 @@ import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { AlertCircle, ArrowLeft, Clock, Gavel, Users, UserCheck, Award, RefreshCw, Lock, AlertTriangle } from "lucide-react";
 import { Product } from "@/services/productService";
 import { getSocket, getSocketUrl, createSocket, checkConnection, closeSocket } from "@/lib/socket";
+import { formatCurrency } from "@/lib/utils";
 
 const LiveBidding = () => {
   const { id } = useParams<{ id: string }>();
@@ -547,7 +548,7 @@ const LiveBidding = () => {
     if (bidAmount < minBid) {
       toast({
         title: "Invalid Bid",
-        description: `Your bid must be at least $${minBid.toFixed(2)}`,
+        description: `Your bid must be at least ${formatCurrency(minBid)}`,
         variant: "destructive",
       });
       return;
@@ -623,7 +624,7 @@ const LiveBidding = () => {
         // Show success toast
         toast({
           title: "Bid Placed!",
-          description: `Your bid of $${bidAmount.toFixed(2)} was placed successfully`,
+          description: `Your bid of ${formatCurrency(bidAmount)} was placed successfully`,
         });
         
         // Update product data from result
@@ -758,7 +759,7 @@ const LiveBidding = () => {
               <p className="text-amber-700">
                 This auction has closed and no more bids can be placed.
                 {product.bidder && (
-                  <span> The winning bid was ${(product.currentBid || 0).toFixed(2)} by {
+                  <span> The winning bid was ${formatCurrency(product.currentBid || 0)} by {
                     typeof product.bidder === 'object' && product.bidder !== null 
                       ? (product.bidder.name || "Anonymous") 
                       : (typeof product.bidder === 'string' ? product.bidder : "Anonymous")
@@ -811,13 +812,13 @@ const LiveBidding = () => {
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium">Starting Bid:</span>
-                  <span className="font-semibold">${product.startingBid?.toFixed(2) || "0.00"}</span>
+                  <span className="font-semibold">{formatCurrency(product.startingBid)}</span>
                 </div>
                 
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium">Current Bid:</span>
                   <span className="font-bold text-lg text-farm-green-600">
-                    ${(product.currentBid || product.startingBid || 0).toFixed(2)}
+                    {formatCurrency(product.currentBid || product.startingBid || 0)}
                   </span>
                 </div>
                 
@@ -877,7 +878,7 @@ const LiveBidding = () => {
                     disabled={isAuctionEnded}
                   />
                   <p className="text-sm text-gray-500 mt-2">
-                    Minimum bid: ${((product.currentBid || product.startingBid || 0) + 0.5).toFixed(2)}
+                    Minimum bid: {formatCurrency((product.currentBid || product.startingBid || 0) + 0.5)}
                   </p>
                 </div>
                 <Button 
@@ -963,7 +964,7 @@ const LiveBidding = () => {
                         </p>
                       </div>
                       <Badge className={index === 0 ? "bg-farm-green-600" : "bg-gray-600"}>
-                        ${bid.amount.toFixed(2)}
+                        {formatCurrency(bid.amount)}
                       </Badge>
                     </div>
                   ))
