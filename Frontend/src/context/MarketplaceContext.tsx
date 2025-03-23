@@ -107,7 +107,7 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // Handle incoming bid updates
     const handleBidUpdate = (data: any) => {
       const { auctionId, amount, bidder } = data;
-      console.log(`Received bid update for ${auctionId}: $${amount} by ${bidder?.name || 'Unknown'}`);
+      console.log(`MARKETPLACE CONTEXT: Received bid update for ${auctionId}: $${amount} by ${bidder?.name || 'Unknown'}`);
       
       // Update the product in state with the new bid information
       setProducts(prevProducts => 
@@ -121,14 +121,64 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
             : product
         )
       );
+      
+      // Also update featured products
+      setFeaturedProducts(prevFeatured => 
+        prevFeatured.map(product => 
+          product.id === auctionId
+            ? {
+                ...product,
+                currentBid: amount,
+                bidder: bidder
+              }
+            : product
+        )
+      );
+      
+      // Broadcast the update globally
+      window.dispatchEvent(new CustomEvent('farm:newBid', {
+        detail: { bidData: data }
+      }));
     };
     
     // Add socket event listener
     socket.on('auction:bid', handleBidUpdate);
     
-    // Clean up listener on unmount
+    // Listen for global product updates
+    const handleProductUpdate = (event: any) => {
+      if (event && event.detail && event.detail.product) {
+        const updatedProduct = event.detail.product;
+        if (!updatedProduct || !updatedProduct.id) return;
+        
+        console.log("MARKETPLACE CONTEXT: Received product update from global event:", updatedProduct);
+        
+        // Update products list
+        setProducts(prevProducts => 
+          prevProducts.map(product => 
+            product.id === updatedProduct.id
+              ? updatedProduct
+              : product
+          )
+        );
+        
+        // Update featured products
+        setFeaturedProducts(prevFeatured => 
+          prevFeatured.map(product => 
+            product.id === updatedProduct.id
+              ? updatedProduct
+              : product
+          )
+        );
+      }
+    };
+    
+    // Add global event listener
+    window.addEventListener('farm:productUpdated', handleProductUpdate);
+    
+    // Clean up listeners on unmount
     return () => {
       socket.off('auction:bid', handleBidUpdate);
+      window.removeEventListener('farm:productUpdated', handleProductUpdate);
     };
   }, []);
 
@@ -318,6 +368,17 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
           }
         });
         
+        // Method 3: Dispatch global custom event for other components
+        console.log("Dispatching global bid event");
+        window.dispatchEvent(new CustomEvent('farm:newBid', {
+          detail: { bidData }
+        }));
+        
+        // Also dispatch product update event
+        window.dispatchEvent(new CustomEvent('farm:productUpdated', {
+          detail: { product: updatedProduct }
+        }));
+        
         // Return the updated product
         return updatedProduct;
       } catch (apiError) {
@@ -343,6 +404,13 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // Emit directly with full data
             socket.emit('auction:bid', fallbackBidData, (response: any) => {
               console.log("Fallback socket bid response:", response);
+              
+              // Also dispatch global event even in fallback
+              if (response && response.success) {
+                window.dispatchEvent(new CustomEvent('farm:newBid', {
+                  detail: { bidData: fallbackBidData }
+                }));
+              }
             });
             
             // Also try library method
@@ -358,6 +426,12 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
                   currentBid: amount,
                   bidder: user
                 };
+                
+                // Dispatch product update event even in fallback
+                window.dispatchEvent(new CustomEvent('farm:productUpdated', {
+                  detail: { product: updatedProduct }
+                }));
+                
                 return updatedProduct;
               }
             }

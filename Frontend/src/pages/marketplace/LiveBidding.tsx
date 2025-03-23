@@ -18,7 +18,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { AlertCircle, ArrowLeft, Clock, Gavel, Users, UserCheck, Award, RefreshCw, Lock, AlertTriangle } from "lucide-react";
 import { Product } from "@/services/productService";
-import { getSocket, getSocketUrl, createSocket, checkConnection, closeSocket } from "@/lib/socket";
+import { getSocket, getSocketUrl, createSocket, checkConnection, closeSocket, broadcastBid } from "@/lib/socket";
 import { formatCurrency } from "@/lib/utils";
 
 const LiveBidding = () => {
@@ -576,48 +576,24 @@ const LiveBidding = () => {
       
       setBidHistory(prev => [newBid, ...prev]);
       
-      // Attempt to place the bid
-      console.log(`LiveBidding: Placing bid of $${bidAmount} on product ${id}`);
-      
-      // Clear any existing errors
-      setError(null);
-      
-      // Get socket to check connection before bidding
-      const socket = getSocket();
-      if (!socket.connected) {
-        console.log("Socket not connected before bid, connecting...");
-        socket.connect();
-        
-        // Short wait to allow connection
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      
       // Attempt the bid through MarketplaceContext
       const result = await placeBid(id, bidAmount);
       
       if (result) {
         console.log('LiveBidding: Bid placed successfully:', result);
         
-        // Ensure the socket event is emitted for real-time updates
+        // Ensure the bid is broadcast to all clients
         try {
-          // Create a structured bid object
-          const bidData = {
-            auctionId: id,
-            amount: bidAmount,
-            userId: user?.id,
-            bidder: {
-              id: user?.id,
-              name: user?.name
-            },
-            timestamp: new Date().toISOString()
+          const bidderInfo = {
+            id: user?.id,
+            name: user?.name || "Anonymous"
           };
           
-          // Emit directly to ensure it's sent
-          socket.emit('auction:bid', bidData, (response) => {
-            console.log("Direct socket bid response:", response);
-          });
-        } catch (socketError) {
-          console.error("Socket emit error:", socketError);
+          // Use the utility function to broadcast the bid
+          const broadcastSuccess = await broadcastBid(id, bidAmount, bidderInfo);
+          console.log(`Bid broadcast ${broadcastSuccess ? 'succeeded' : 'may have failed'}`);
+        } catch (broadcastError) {
+          console.error("Error broadcasting bid:", broadcastError);
           // Continue anyway since API bid was successful
         }
         

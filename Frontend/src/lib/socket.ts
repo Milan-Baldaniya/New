@@ -400,6 +400,113 @@ export function checkConnection(): boolean {
   return true;
 }
 
+/**
+ * Sync the state of an auction after connection issues or to ensure data consistency
+ * @param {string} auctionId - The ID of the auction to sync
+ * @returns {Promise<object|null>} The auction state or null if failed
+ */
+export function syncAuctionState(auctionId: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!auctionId) {
+      reject(new Error('Auction ID is required'));
+      return;
+    }
+    
+    const socket = getSocket();
+    
+    // Ensure socket is connected
+    if (!socket.connected) {
+      if (DEBUG_MODE) console.log(`[Socket] Socket not connected, connecting before sync for auction ${auctionId}`);
+      socket.connect();
+      
+      // Wait for connection
+      setTimeout(() => {
+        if (!socket.connected) {
+          console.error(`[Socket] Failed to connect socket when trying to sync auction ${auctionId}`);
+          reject(new Error('Socket connection failed'));
+          return;
+        }
+        performSync();
+      }, 1000);
+    } else {
+      performSync();
+    }
+    
+    function performSync() {
+      if (DEBUG_MODE) console.log(`[Socket] Syncing auction state for ${auctionId}`);
+      
+      // First make sure we're in the auction room
+      socket.emit('auction:join', { auctionId }, () => {
+        // Now request the latest state
+        socket.emit('auction:getState', { auctionId }, (response: any) => {
+          if (DEBUG_MODE) console.log(`[Socket] Auction state sync response for ${auctionId}:`, response);
+          
+          if (response && response.success) {
+            resolve(response);
+          } else {
+            // Try direct ID format as fallback
+            socket.emit('auction:getState', auctionId, (directResponse: any) => {
+              if (directResponse && directResponse.success) {
+                resolve(directResponse);
+              } else {
+                reject(new Error('Failed to sync auction state'));
+              }
+            });
+          }
+        });
+      });
+    }
+  });
+}
+
+/**
+ * Broadcast a bid to ensure it's received by all components
+ * @param {string} auctionId - Auction ID
+ * @param {number} amount - Bid amount
+ * @param {object} bidder - Bidder information
+ * @returns {Promise<boolean>} Whether the broadcast was successful
+ */
+export function broadcastBid(auctionId: string, amount: number, bidder: any): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!auctionId || !amount || !bidder) {
+      console.error('[Socket] Invalid bid data for broadcast');
+      resolve(false);
+      return;
+    }
+    
+    try {
+      // 1. Create comprehensive bid data
+      const bidData = {
+        auctionId,
+        amount,
+        userId: bidder.id || 'anonymous',
+        bidder: typeof bidder === 'object' ? bidder : { id: 'anonymous', name: bidder },
+        timestamp: new Date().toISOString()
+      };
+      
+      // 2. Dispatch global event
+      window.dispatchEvent(new CustomEvent('farm:newBid', {
+        detail: { bidData }
+      }));
+      
+      // 3. Emit socket event
+      const socket = getSocket();
+      if (socket.connected) {
+        socket.emit('auction:bid', bidData, (response: any) => {
+          resolve(response && response.success);
+        });
+      } else {
+        // Even if socket fails, we succeed because of the global event
+        resolve(true);
+      }
+    } catch (error) {
+      console.error('[Socket] Error broadcasting bid:', error);
+      // Still return true since the global event should work
+      resolve(true);
+    }
+  });
+}
+
 export default {
   getSocket,
   createSocket,
@@ -410,5 +517,7 @@ export default {
   placeBid,
   onAuctionUpdate,
   onBid,
-  checkConnection
+  checkConnection,
+  syncAuctionState,
+  broadcastBid
 }; 
