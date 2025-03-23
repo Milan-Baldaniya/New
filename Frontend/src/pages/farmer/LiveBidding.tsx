@@ -16,7 +16,7 @@ import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
-import { Clock, Gavel, Users, UserCheck, ArrowRight, AlertCircle, Bell, DollarSign, TrendingUp } from "lucide-react";
+import { Clock, Gavel, Users, UserCheck, ArrowRight, AlertCircle, Bell, DollarSign, TrendingUp, RefreshCw } from "lucide-react";
 import { Product } from "@/services/productService";
 import { getSocket } from "@/lib/socket";
 import { AnimatePresence, motion } from "framer-motion";
@@ -54,6 +54,44 @@ const LiveBidding = () => {
     productImage?: string;
   } | null>(null);
 
+  // Handle manual refresh
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    
+    try {
+      // Refetch products from API
+      await fetchProducts({ farmer: user?.id, isAuction: true });
+      
+      // Also reconnect to socket rooms
+      const socket = getSocket();
+      
+      if (!socket.connected) {
+        socket.connect();
+      }
+      
+      // Rejoin auction rooms
+      activeAuctions.forEach(auction => {
+        socket.emit("auction:join", { auctionId: auction.id });
+      });
+      
+      toast({
+        title: "Refreshed",
+        description: "Auction data has been refreshed",
+      });
+    } catch (error) {
+      console.error("Failed to refresh auction data:", error);
+      toast({
+        title: "Refresh failed",
+        description: "Could not refresh auction data",
+        variant: "destructive",
+      });
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
   // Fetch farmer's auction products
   useEffect(() => {
     const loadProducts = async () => {
@@ -88,6 +126,12 @@ const LiveBidding = () => {
     if (!products || products.length === 0) return;
     
     const socket = getSocket();
+    
+    // Ensure socket is connected
+    if (!socket.connected) {
+      console.log('LiveBidding: Socket not connected, attempting to connect...');
+      socket.connect();
+    }
 
     const auctionItems = products.filter(product => product.bidding);
     setAuctionProducts(auctionItems);
@@ -117,52 +161,201 @@ const LiveBidding = () => {
 
     // Connect to socket for each active auction
     active.forEach(auction => {
-      socket.emit("joinAuction", { auctionId: auction.id });
+      console.log(`Joining auction room for ${auction.id}`);
+      
+      // First try the object format
+      socket.emit("auction:join", { auctionId: auction.id }, (response) => {
+        if (response && response.success) {
+          console.log(`Successfully joined auction room: ${auction.id}`);
+        } else {
+          // If object format fails, try direct ID format
+          console.log(`Trying direct ID join for auction: ${auction.id}`);
+          socket.emit("auction:join", auction.id, (directResponse) => {
+            if (directResponse && directResponse.success) {
+              console.log(`Successfully joined auction room with direct ID: ${auction.id}`);
+            } else {
+              console.error(`Failed to join auction room: ${auction.id}`);
+            }
+          });
+        }
+      });
 
       // Initialize live data for this auction
       setLiveData(prev => ({
         ...prev,
         [auction.id]: {
-          participants: Math.floor(Math.random() * 8) + 2, // Mock data
+          participants: 0, // Will be updated by socket events
           recentBids: []
         }
       }));
     });
 
+    // Debug socket status
+    const debugInterval = setInterval(() => {
+      const isConnected = socket.connected;
+      console.log(`LiveBidding: Socket connected: ${isConnected ? 'Yes' : 'No'}`);
+      
+      if (!isConnected) {
+        console.log('LiveBidding: Socket disconnected, attempting to reconnect...');
+        socket.connect();
+      }
+    }, 10000);
+
     // Clean up socket connections when component unmounts
     return () => {
       active.forEach(auction => {
-        socket.emit("leaveAuction", { auctionId: auction.id });
+        console.log(`Leaving auction room: ${auction.id}`);
+        socket.emit("auction:leave", { auctionId: auction.id });
+        socket.emit("auction:leave", auction.id);
       });
+      
+      clearInterval(debugInterval);
     };
   }, [products]);
+
+  // Periodic auction status check to update categories
+  useEffect(() => {
+    if (!products || products.length === 0) return;
+    
+    const checkAuctionStatus = () => {
+      console.log('Checking auction statuses...');
+      const now = new Date();
+      
+      // Re-categorize auctions
+      const auctionItems = products.filter(product => product.bidding);
+      
+      const active = auctionItems.filter(product => {
+        const endDate = new Date(product.endBidTime || '');
+        const startDate = new Date(product.startBidTime || '');
+        return startDate <= now && endDate > now;
+      });
+      
+      const upcoming = auctionItems.filter(product => {
+        const startDate = new Date(product.startBidTime || '');
+        return startDate > now;
+      });
+      
+      const completed = auctionItems.filter(product => {
+        const endDate = new Date(product.endBidTime || '');
+        return endDate <= now;
+      });
+      
+      // Update state if categories have changed
+      if (JSON.stringify(active.map(p => p.id)) !== JSON.stringify(activeAuctions.map(p => p.id))) {
+        console.log('Active auctions changed, updating...');
+        setActiveAuctions(active);
+      }
+      
+      if (JSON.stringify(upcoming.map(p => p.id)) !== JSON.stringify(upcomingAuctions.map(p => p.id))) {
+        console.log('Upcoming auctions changed, updating...');
+        setUpcomingAuctions(upcoming);
+      }
+      
+      if (JSON.stringify(completed.map(p => p.id)) !== JSON.stringify(completedAuctions.map(p => p.id))) {
+        console.log('Completed auctions changed, updating...');
+        setCompletedAuctions(completed);
+      }
+    };
+    
+    // Check initially
+    checkAuctionStatus();
+    
+    // Set up interval to check auction status every minute
+    const statusInterval = setInterval(checkAuctionStatus, 60000);
+    
+    return () => clearInterval(statusInterval);
+  }, [products, activeAuctions, upcomingAuctions, completedAuctions]);
 
   // Enhanced socket listeners for real-time updates
   useEffect(() => {
     const socket = getSocket();
     
-    socket.on("auction:bid", (data) => {
+    // Debug: Log the current socket connection status
+    console.log(`Socket connection status: ${socket.connected ? 'Connected' : 'Disconnected'}`);
+    
+    // Handler for the auction:bid event
+    const handleBid = (data) => {
+      console.log('Received bid event:', data);
       const { auctionId, amount, bidder, timestamp } = data;
       
       // Update live data for the auction
       setLiveData(prev => {
         const auctionData = prev[auctionId] || { participants: 0, recentBids: [] };
+        
+        const bidderName = typeof bidder === 'object' ? bidder.name : 
+                          bidder?.name ? bidder.name : 
+                          typeof bidder === 'string' ? bidder : 'Anonymous';
+        
         return {
           ...prev,
           [auctionId]: {
             ...auctionData,
             recentBids: [
-              { amount, bidder, timestamp: new Date(timestamp) },
+              { amount, bidder: bidderName, timestamp: new Date(timestamp) },
               ...auctionData.recentBids
             ].slice(0, 5) // Keep only the 5 most recent bids
           }
         };
       });
       
+      // Also update the product's current bid in state
+      setAuctionProducts(prevProducts => 
+        prevProducts.map(product => 
+          product.id === auctionId
+            ? {
+                ...product,
+                currentBid: amount,
+                bidder: bidder
+              }
+            : product
+        )
+      );
+      
+      // Update active and other auction categories
+      const now = new Date();
+      
+      setActiveAuctions(prev => 
+        prev.map(product => 
+          product.id === auctionId
+            ? {
+                ...product,
+                currentBid: amount,
+                bidder: bidder
+              }
+            : product
+        )
+      );
+      
+      setUpcomingAuctions(prev => 
+        prev.map(product => 
+          product.id === auctionId
+            ? {
+                ...product,
+                currentBid: amount,
+                bidder: bidder
+              }
+            : product
+        )
+      );
+      
+      setCompletedAuctions(prev => 
+        prev.map(product => 
+          product.id === auctionId
+            ? {
+                ...product,
+                currentBid: amount,
+                bidder: bidder
+              }
+            : product
+        )
+      );
+      
       // Find product name for the notification
       const product = products.find(p => p.id === auctionId);
       if (product) {
-        const bidderName = typeof bidder === 'object' ? bidder.name : bidder;
+        const bidderName = typeof bidder === 'object' ? bidder.name : 
+                          bidder?.name ? bidder.name : 
+                          typeof bidder === 'string' ? bidder : 'Anonymous';
         
         // Set active notification for animation
         setActiveNotification({
@@ -199,25 +392,57 @@ const LiveBidding = () => {
           setActiveNotification(null);
         }, 5000);
       }
-    });
+    };
 
-    socket.on("auction:update", (data) => {
+    socket.on("auction:bid", handleBid);
+
+    const handleParticipantUpdate = (data) => {
+      console.log('Received participant update:', data);
       const { auctionId, participantCount } = data;
       
-      setLiveData(prev => ({
-        ...prev,
-        [auctionId]: {
-          ...prev[auctionId],
-          participants: participantCount
-        }
-      }));
-    });
+      setLiveData(prev => {
+        const auctionData = prev[auctionId] || { participants: 0, recentBids: [] };
+        return {
+          ...prev,
+          [auctionId]: {
+            ...auctionData,
+            participants: participantCount || auctionData.participants
+          }
+        };
+      });
+    };
+
+    socket.on("auction:update", handleParticipantUpdate);
+
+    // Setup connection status handler
+    const handleConnect = () => {
+      console.log('Socket connected event fired');
+      
+      // Rejoin auction rooms for active auctions
+      activeAuctions.forEach(auction => {
+        console.log(`Rejoining auction room after reconnect: ${auction.id}`);
+        socket.emit("auction:join", { auctionId: auction.id });
+        socket.emit("auction:join", auction.id);
+      });
+    };
+
+    socket.on('connect', handleConnect);
+
+    // Check connection status periodically
+    const connectionInterval = setInterval(() => {
+      if (!socket.connected) {
+        console.log('Socket disconnected, attempting to reconnect...');
+        socket.connect();
+      }
+    }, 15000);
 
     return () => {
-      socket.off("auction:bid");
-      socket.off("auction:update");
+      socket.off("auction:bid", handleBid);
+      socket.off("auction:update", handleParticipantUpdate);
+      socket.off('connect', handleConnect);
+      clearInterval(connectionInterval);
     };
-  }, [products, toast]);
+  }, [products, activeAuctions, toast]);
 
   // Calculate time left for an auction
   const calculateTimeLeft = (endTime: string | undefined) => {
@@ -254,96 +479,97 @@ const LiveBidding = () => {
 
   // Render auction card
   const renderAuctionCard = (product: Product) => {
+    const auctionData = liveData[product.id] || { participants: 0, recentBids: [] };
     const timeLeft = calculateTimeLeft(product.endBidTime);
-    const liveInfo = liveData[product.id] || { participants: 0, recentBids: [] };
+    const currentBid = product.currentBid || product.startingBid || 0;
+    
+    // Check if in development mode
+    const isDevelopment = import.meta.env.DEV;
     
     return (
-      <Card key={product.id} className="mb-4 overflow-hidden">
-        <div className="flex flex-col md:flex-row">
-          <div className="w-full md:w-1/3">
-            <AspectRatio ratio={4/3} className="bg-gray-100">
-              {product.images && product.images.length > 0 ? (
-                <img
-                  src={product.images[0]}
-                  alt={product.name}
-                  className="object-cover w-full h-full"
-                />
-              ) : (
-                <div className="flex items-center justify-center w-full h-full bg-gray-200">
-                  <AlertCircle className="w-8 h-8 text-gray-400" />
-                </div>
-              )}
-            </AspectRatio>
+      <div className="bg-white border rounded-lg shadow-sm overflow-hidden">
+        <div className="p-4">
+          <h3 className="font-semibold text-lg mb-1 line-clamp-1">{product.name}</h3>
+          <p className="text-gray-500 text-sm mb-3 line-clamp-2">{product.description}</p>
+          
+          <div className="flex flex-wrap gap-3 mb-3">
+            <Badge variant="outline" className="flex items-center gap-1">
+              <Clock className="h-3 w-3" />
+              <span className={timeLeft === "Ended" ? "text-red-500" : ""}>{timeLeft}</span>
+            </Badge>
+            
+            <Badge variant="outline" className="flex items-center gap-1">
+              <Users className="h-3 w-3" />
+              <span>{auctionData.participants} bidder{auctionData.participants !== 1 ? 's' : ''}</span>
+            </Badge>
+            
+            {product.organic && (
+              <Badge className="bg-green-100 text-green-800 border-green-200">
+                Organic
+              </Badge>
+            )}
           </div>
           
-          <div className="flex-1 p-4">
-            <div className="flex justify-between items-start">
-              <div>
-                <h3 className="text-lg font-semibold">{product.name}</h3>
-                <p className="text-sm text-gray-500 mt-1 line-clamp-2">{product.description}</p>
-              </div>
-              <Badge 
-                variant={timeLeft === "Ended" ? "outline" : "default"}
-                className={timeLeft === "Ended" ? "bg-gray-200" : "bg-green-100 text-green-800"}
-              >
-                {timeLeft === "Ended" ? "Completed" : "Active"}
-              </Badge>
+          {product.images && product.images.length > 0 && (
+            <div className="mb-3">
+              <AspectRatio ratio={16 / 9}>
+                <img 
+                  src={product.images[0]} 
+                  alt={product.name} 
+                  className="rounded-md object-cover w-full h-full"
+                />
+              </AspectRatio>
             </div>
-            
-            <div className="grid grid-cols-2 gap-4 mt-4">
-              <div>
-                <p className="text-sm text-gray-500">Current Bid</p>
-                <p className="text-lg font-semibold">
-                  {formatCurrency(product.currentBid || product.startingBid)}
-                </p>
-              </div>
-              <div>
-                <p className="text-sm text-gray-500">Time Left</p>
-                <div className="flex items-center">
-                  <Clock className="w-4 h-4 mr-1 text-orange-500" />
-                  <p className="font-semibold">{timeLeft}</p>
-                </div>
-              </div>
-              <div>
-                <p className="text-sm text-gray-500">Starting Bid</p>
-                <p>{formatCurrency(product.startingBid)}</p>
-              </div>
-              <div>
-                <p className="text-sm text-gray-500">Participants</p>
-                <div className="flex items-center">
-                  <Users className="w-4 h-4 mr-1 text-blue-500" />
-                  <p>{liveInfo.participants}</p>
-                </div>
-              </div>
+          )}
+          
+          <div className="flex justify-between items-center mb-3">
+            <div>
+              <p className="text-xs text-gray-500">Starting Bid</p>
+              <p className="font-medium">{formatCurrency(product.startingBid)}</p>
             </div>
-            
-            {liveInfo.recentBids.length > 0 && (
-              <div className="mt-4">
-                <p className="text-sm text-gray-500 mb-2">Recent Activity</p>
-                <div className="bg-gray-50 p-2 rounded-md max-h-20 overflow-y-auto">
-                  {liveInfo.recentBids.map((bid, idx) => (
-                    <div key={idx} className="text-xs flex justify-between py-1">
-                      <span>{bid.bidder}</span>
-                      <span className="font-semibold">{formatCurrency(bid.amount)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-            
-            <div className="mt-4 flex justify-end">
-              <Button 
-                variant="outline" 
-                className="flex items-center" 
-                onClick={() => viewAuctionDetails(product.id)}
-              >
-                View Details
-                <ArrowRight className="ml-2 w-4 h-4" />
-              </Button>
+            <div>
+              <p className="text-xs text-gray-500">Current Bid</p>
+              <p className="font-bold text-green-600">{formatCurrency(currentBid)}</p>
             </div>
           </div>
+          
+          {auctionData.recentBids.length > 0 && (
+            <div className="mb-3">
+              <p className="text-xs text-gray-500 mb-1">Recent Bidding Activity</p>
+              <div className="bg-gray-50 p-2 rounded text-sm">
+                {auctionData.recentBids.slice(0, 3).map((bid, index) => (
+                  <div key={index} className="flex justify-between items-center py-1">
+                    <span className="font-medium truncate">{bid.bidder}</span>
+                    <span>{formatCurrency(bid.amount)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          
+          <div className="grid grid-cols-1 gap-2">
+            <Button 
+              variant="outline" 
+              className="w-full flex items-center justify-center gap-2"
+              onClick={() => viewAuctionDetails(product.id)}
+            >
+              <span>View Details</span>
+              <ArrowRight className="h-4 w-4" />
+            </Button>
+            
+            {isDevelopment && timeLeft !== "Ended" && (
+              <Button 
+                variant="outline" 
+                size="sm"
+                className="w-full text-amber-600 border-amber-200 bg-amber-50 hover:bg-amber-100"
+                onClick={() => simulateTestBid(product.id)}
+              >
+                Test Bid
+              </Button>
+            )}
+          </div>
         </div>
-      </Card>
+      </div>
     );
   };
 
@@ -564,6 +790,70 @@ const LiveBidding = () => {
     );
   };
 
+  // For debugging - simulate a bid on a product
+  const simulateTestBid = (productId: string) => {
+    const socket = getSocket();
+    
+    if (!socket.connected) {
+      toast({
+        title: "Socket not connected",
+        description: "Cannot simulate bid - socket is not connected",
+        variant: "destructive"
+      });
+      socket.connect();
+      return;
+    }
+    
+    const product = products.find(p => p.id === productId);
+    if (!product) {
+      toast({
+        title: "Product not found",
+        description: "Cannot simulate bid on unknown product",
+        variant: "destructive"
+      });
+      return;
+    }
+    
+    // Create a test bid amount slightly higher than current
+    const currentBid = product.currentBid || product.startingBid || 0;
+    const bidAmount = currentBid + 0.5;
+    
+    // Create test bidder
+    const testBidder = {
+      id: "test-user-" + Math.floor(Math.random() * 1000),
+      name: "Test Bidder " + Math.floor(Math.random() * 100)
+    };
+    
+    // Create bid data
+    const bidData = {
+      auctionId: productId,
+      amount: bidAmount,
+      userId: testBidder.id,
+      bidder: testBidder,
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log(`LiveBidding: Simulating test bid:`, bidData);
+    
+    // Emit directly
+    socket.emit('auction:bid', bidData, (response: any) => {
+      console.log("Test bid response:", response);
+      
+      if (response && response.success) {
+        toast({
+          title: "Test bid sent",
+          description: `Simulated bid of ${formatCurrency(bidAmount)} on ${product.name}`,
+        });
+      } else {
+        toast({
+          title: "Test bid failed",
+          description: response?.error || "Unknown error",
+          variant: "destructive"
+        });
+      }
+    });
+  };
+
   return (
     <div className="container mx-auto px-4 py-6">
       {/* Render the animated notification block */}
@@ -598,6 +888,16 @@ const LiveBidding = () => {
           </div>
           <Button onClick={() => navigate("/farmer/dashboard/add-product")}>
             Create New Auction
+          </Button>
+          <Button 
+            variant="outline" 
+            size="sm" 
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            className="flex items-center gap-2"
+          >
+            <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+            {isRefreshing ? 'Refreshing...' : 'Refresh'}
           </Button>
         </div>
       </div>

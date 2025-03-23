@@ -347,173 +347,101 @@ const LiveBidding = () => {
     };
   }, [id, fetchProductById, navigate, toast]);
   
-  // Set up socket connection for real-time updates
+  // Join auction room and set up listeners
   useEffect(() => {
-    if (!product) {
-      console.log('LiveBidding: No product data, skipping socket setup');
-      return;
-    }
+    if (!id) return;
     
-    console.log(`LiveBidding: Setting up socket connection for auction ${product.id}`);
-    console.log('LiveBidding: Socket connected status:', getSocket().connected);
-    console.log('LiveBidding: Socket ID:', getSocket().id);
-    
+    console.log(`Joining auction room for ${id}`);
     const socket = getSocket();
     
-    // Check for socket connection issues and reconnect if needed
+    // Ensure socket is connected
     if (!socket.connected) {
-      console.log('LiveBidding: Socket not connected, attempting to connect');
+      console.log('Socket not connected, connecting...');
       socket.connect();
-      
-      // Force reconnect if still not connected
-      if (!socket.connected) {
-        console.log('LiveBidding: Socket still not connected after connect() call, creating new socket');
-        createSocket();
-      }
     }
     
-    // Join the auction room
-    socket.emit("auction:join", product.id, (response) => {
-      console.log("Joined auction room:", response);
-      // Update participant count on successful join
+    // Join auction room - try both formats for compatibility
+    socket.emit('auction:join', { auctionId: id }, (response) => {
       if (response && response.success) {
-        setParticipants(response.participantCount);
+        console.log('Successfully joined auction room with object format');
+        setParticipants(response.participantCount || 1);
       } else {
-        console.error("Failed to join auction room:", response);
-        // Try again after a short delay
-        setTimeout(() => {
-          if (isMounted.current) {
-            socket.emit("auction:join", product.id);
+        // Try direct ID format
+        socket.emit('auction:join', id, (directResponse) => {
+          if (directResponse && directResponse.success) {
+            console.log('Successfully joined auction room with direct ID');
+            setParticipants(directResponse.participantCount || 1);
+          } else {
+            console.error('Failed to join auction room in both formats');
           }
-        }, 2000);
+        });
       }
     });
     
-    // Confirm connection status
-    console.log(`LiveBidding: Socket connected: ${socket.connected ? 'Yes' : 'No'}, ID: ${socket.id}`);
-    
-    // Listen for new bids
-    const handleNewBid = (data: any) => {
-      console.log(`LiveBidding: Received new bid:`, data);
-      if (!isMounted.current) return;
+    // Listener for new bids
+    const handleBid = (data) => {
+      console.log('Received bid event:', data);
+      const { auctionId, amount, bidder, timestamp } = data;
       
-      // Validate the bid data
-      if (!data || typeof data !== 'object') {
-        console.error('Invalid bid data received:', data);
-        return;
-      }
+      // Only process if this is for our auction
+      if (auctionId !== id) return;
       
-      // Ensure this bid is for the current auction
-      if (data.auctionId && data.auctionId !== product.id) {
-        console.log(`Ignoring bid for different auction: ${data.auctionId}`);
-        return;
-      }
+      // Get bidder name
+      const bidderName = typeof bidder === 'object' ? bidder.name : 
+                        bidder?.name ? bidder.name : 
+                        typeof bidder === 'string' ? bidder : 'Anonymous';
       
-      // Extract values with proper fallbacks
-      const amount = typeof data.amount === 'number' ? data.amount : 0;
-      const bidder = data.bidder || { name: 'Anonymous' };
-      const bidderName = typeof bidder === 'object' && bidder !== null 
-        ? (bidder.name || 'Anonymous') 
-        : (typeof bidder === 'string' ? bidder : 'Anonymous');
-      const timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
-      
-      // Update product with new bid if amount is valid
-      if (amount > 0) {
-        setProduct(prevProduct => {
-          if (!prevProduct) return null;
-          
-          return {
-            ...prevProduct,
-            currentBid: amount,
-            bidder: bidder
-          };
-        });
-        
-        // Update product ref for timer calculations
-        if (productRef.current) {
-          productRef.current = {
-            ...productRef.current,
-            currentBid: amount,
-            bidder: bidder
-          };
-        }
-        
-        // Update bid history
-        const newBid = {
+      // Add to bid history
+      setBidHistory(prev => [
+        {
           amount,
           bidder: bidderName,
-          timestamp
-        };
-        
-        setBidHistory(prev => {
-          // Check if this bid is already in history (avoid duplicates)
-          const isDuplicate = prev.some(existingBid => 
-            existingBid.amount === amount && 
-            existingBid.bidder === bidderName &&
-            Math.abs(existingBid.timestamp.getTime() - timestamp.getTime()) < 1000
-          );
-          
-          if (isDuplicate) {
-            console.log('Duplicate bid detected, not adding to history');
-            return prev;
-          }
-          
-          return [newBid, ...prev];
-        });
-        
-        // Update minimum bid amount
-        setBidAmount(amount + 0.5);
-        
-        // Show toast notification
-        toast({
-          title: "New Bid Placed!",
-          description: `${bidderName} bid $${amount.toFixed(2)}`,
-        });
-      } else {
-        console.warn('Received invalid bid amount:', amount);
-      }
-    };
-    
-    // Listen for participant count updates
-    const handleParticipantUpdate = (data: any) => {
-      console.log(`LiveBidding: Participant update:`, data);
-      if (isMounted.current && data && data.auctionId === product.id) {
-        setParticipants(data.participantCount || 0);
-      }
-    };
-    
-    // Listen for auction status updates
-    const handleAuctionStatus = (data: any) => {
-      console.log(`LiveBidding: Auction status update:`, data);
-      if (isMounted.current && data && data.auctionId === product.id) {
-        // Check if auction has ended
-        if (data.isEnded) {
-          setIsAuctionEnded(true);
-          setTimeLeft("Auction ended");
-        }
-      }
-    };
-    
-    // Register event listeners
-    socket.on("auction:bid", handleNewBid);
-    socket.on("auction:update", handleParticipantUpdate);
-    socket.on("auction:status", handleAuctionStatus);
-    
-    return () => {
-      console.log('LiveBidding: Cleaning up socket connections');
-      // Leave the auction room
-      if (socket.connected && product.id) {
-        socket.emit("auction:leave", product.id, (response) => {
-          console.log("Left auction room:", response);
-        });
-      }
+          timestamp: new Date(timestamp || new Date())
+        },
+        ...prev
+      ]);
       
-      // Remove all event listeners
-      socket.off("auction:bid", handleNewBid);
-      socket.off("auction:update", handleParticipantUpdate);
-      socket.off("auction:status", handleAuctionStatus);
+      // Update product data
+      setProduct(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          currentBid: amount,
+          bidder: bidder
+        };
+      });
+      
+      // Update product ref for other effects
+      if (productRef.current) {
+        productRef.current = {
+          ...productRef.current,
+          currentBid: amount,
+          bidder: bidder
+        };
+      }
     };
-  }, [product?.id, toast]); // Only depend on product.id and toast, not the entire product object
+    
+    // Listener for participant updates
+    const handleParticipantUpdate = (data) => {
+      console.log('Received participant update:', data);
+      if (data.auctionId === id) {
+        setParticipants(data.participantCount || participants);
+      }
+    };
+    
+    // Register listeners
+    socket.on('auction:bid', handleBid);
+    socket.on('auction:update', handleParticipantUpdate);
+    
+    // Clean up on unmount
+    return () => {
+      console.log(`Leaving auction room for ${id}`);
+      socket.emit('auction:leave', { auctionId: id });
+      socket.emit('auction:leave', id);
+      socket.off('auction:bid', handleBid);
+      socket.off('auction:update', handleParticipantUpdate);
+    };
+  }, [id, participants]);
   
   // Update time left for auction - only set up once when product loads
   useEffect(() => {
@@ -653,11 +581,44 @@ const LiveBidding = () => {
       // Clear any existing errors
       setError(null);
       
+      // Get socket to check connection before bidding
+      const socket = getSocket();
+      if (!socket.connected) {
+        console.log("Socket not connected before bid, connecting...");
+        socket.connect();
+        
+        // Short wait to allow connection
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
       // Attempt the bid through MarketplaceContext
       const result = await placeBid(id, bidAmount);
       
       if (result) {
         console.log('LiveBidding: Bid placed successfully:', result);
+        
+        // Ensure the socket event is emitted for real-time updates
+        try {
+          // Create a structured bid object
+          const bidData = {
+            auctionId: id,
+            amount: bidAmount,
+            userId: user?.id,
+            bidder: {
+              id: user?.id,
+              name: user?.name
+            },
+            timestamp: new Date().toISOString()
+          };
+          
+          // Emit directly to ensure it's sent
+          socket.emit('auction:bid', bidData, (response) => {
+            console.log("Direct socket bid response:", response);
+          });
+        } catch (socketError) {
+          console.error("Socket emit error:", socketError);
+          // Continue anyway since API bid was successful
+        }
         
         // Show success toast
         toast({
@@ -699,22 +660,14 @@ const LiveBidding = () => {
       // Roll back optimistic UI updates on error
       if (product) {
         setProduct(product);
-        
-        // Remove the optimistically added bid from history
         setBidHistory(prev => prev.filter((bid, index) => index > 0));
       }
       
       toast({
         title: "Bid Failed",
-        description: error instanceof Error ? error.message : "There was an error placing your bid",
+        description: error instanceof Error ? error.message : "Failed to place bid",
         variant: "destructive",
       });
-      
-      // Check socket connection on error
-      if (!socketConnected) {
-        console.log('LiveBidding: Socket not connected during bid error, attempting to reconnect');
-        reconnectSocket();
-      }
     } finally {
       setIsPlacingBid(false);
     }

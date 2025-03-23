@@ -141,24 +141,59 @@ export function joinAuction(auctionId: string): Promise<any> {
     const socketInstance = getSocket();
     if (DEBUG_MODE) console.log(`[Socket] Joining auction: ${auctionId}`);
     
-    // Leave previous auction if any
-    if (currentAuctionId && currentAuctionId !== auctionId) {
-      leaveAuction(currentAuctionId).catch(error => {
-        console.warn(`[Socket] Error leaving previous auction: ${error.message}`);
+    // If socket isn't connected, reconnect first
+    if (!socketInstance.connected) {
+      console.log('[Socket] Socket not connected when trying to join auction. Connecting...');
+      socketInstance.connect();
+      
+      // Wait for connection before continuing
+      setTimeout(() => {
+        if (!socketInstance.connected) {
+          console.error('[Socket] Failed to connect socket before joining auction');
+          reject(new Error('Socket connection failed'));
+          return;
+        }
+        attemptJoin();
+      }, 1000);
+    } else {
+      attemptJoin();
+    }
+    
+    function attemptJoin() {
+      // Leave previous auction if any
+      if (currentAuctionId && currentAuctionId !== auctionId) {
+        leaveAuction(currentAuctionId).catch(error => {
+          console.warn(`[Socket] Error leaving previous auction: ${error.message}`);
+        });
+      }
+      
+      console.log(`[Socket] Emitting auction:join for auction ${auctionId}`);
+      
+      // Try to join directly with auction ID first - older server format
+      socketInstance.emit('auction:join', auctionId, (response: any) => {
+        if (response && response.success) {
+          handleSuccessResponse(response);
+        } else {
+          // If direct ID failed, try with object format - newer server format
+          console.log('[Socket] Direct ID join failed, trying object format...');
+          socketInstance.emit('auction:join', { auctionId }, (objResponse: any) => {
+            if (objResponse && objResponse.success) {
+              handleSuccessResponse(objResponse);
+            } else {
+              const error = (response?.error || objResponse?.error || 'Failed to join auction');
+              console.error(`[Socket] Error joining auction in both formats: ${error}`);
+              reject(new Error(error));
+            }
+          });
+        }
       });
     }
     
-    socketInstance.emit('auction:join', auctionId, (response: any) => {
-      if (response && response.success) {
-        currentAuctionId = auctionId;
-        if (DEBUG_MODE) console.log(`[Socket] Joined auction ${auctionId} with ${response.participantCount} participants`);
-        resolve(response);
-      } else {
-        const error = response?.error || 'Failed to join auction';
-        console.error(`[Socket] Error joining auction: ${error}`);
-        reject(new Error(error));
-      }
-    });
+    function handleSuccessResponse(response: any) {
+      currentAuctionId = auctionId;
+      if (DEBUG_MODE) console.log(`[Socket] Joined auction ${auctionId} with ${response.participantCount} participants`);
+      resolve(response);
+    }
   });
 }
 

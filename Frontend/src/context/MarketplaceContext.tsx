@@ -272,11 +272,41 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
           )
         );
         
+        // Force socket connection check before emitting
+        const socket = getSocket();
+        if (!socket.connected) {
+          console.log("Socket not connected before bid, connecting...");
+          socket.connect();
+          
+          // Short wait to allow connection
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
         // Now emit the bid via socket for real-time updates to other users
         // Even if this fails, our database already has the bid recorded
         try {
+          console.log(`Emitting socket bid event for ${productId} with amount ${amount}`);
+          
+          // Enhanced bid data with user information
+          const bidData = {
+            auctionId: productId,
+            amount: amount,
+            userId: user.id,
+            bidder: {
+              id: user.id,
+              name: user.name
+            },
+            timestamp: new Date().toISOString()
+          };
+          
+          // Emit directly to ensure it's sent
+          socket.emit('auction:bid', bidData, (response: any) => {
+            console.log("Socket bid direct response:", response);
+          });
+          
+          // Also use the library function as backup
           const socketResponse = await emitBid(productId, amount, user.id);
-          console.log("Socket bid response:", socketResponse);
+          console.log("Socket bid library response:", socketResponse);
         } catch (socketError) {
           console.error("Socket bid error:", socketError);
           // Continue since API call was successful
