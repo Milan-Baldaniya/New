@@ -59,6 +59,10 @@ export interface ProductFilters {
   minPrice?: number;
   maxPrice?: number;
   isOrganic?: boolean;
+  organic?: boolean; // For backward compatibility
+  sort?: string;
+  page?: number;
+  limit?: number;
 }
 
 // Transform API product to frontend product format
@@ -101,14 +105,19 @@ export const productService = {
       if (filters) {
         const params = new URLSearchParams();
         
+        // Category filter
         if (filters.category) {
-          params.append('category', filters.category);
+          // Convert category format to match backend if needed
+          const category = filters.category.toLowerCase();
+          params.append('category', category);
         }
         
+        // Search filter
         if (filters.search) {
           params.append('search', filters.search);
         }
         
+        // Price range filters - use MongoDB style query parameters
         if (filters.minPrice !== undefined) {
           params.append('price[gte]', filters.minPrice.toString());
         }
@@ -117,13 +126,30 @@ export const productService = {
           params.append('price[lte]', filters.maxPrice.toString());
         }
         
-        if (filters.isOrganic !== undefined) {
-          params.append('isOrganic', filters.isOrganic.toString());
+        // Organic filter - handle both property names
+        const isOrganic = filters.isOrganic !== undefined ? filters.isOrganic : filters.organic;
+        if (isOrganic !== undefined) {
+          params.append('isOrganic', isOrganic.toString());
+        }
+        
+        // Sorting
+        if (filters.sort) {
+          params.append('sort', filters.sort);
+        }
+        
+        // Pagination
+        if (filters.page) {
+          params.append('page', filters.page.toString());
+        }
+        
+        if (filters.limit) {
+          params.append('limit', filters.limit.toString());
         }
         
         queryParams = `?${params.toString()}`;
       }
       
+      console.log("Product service API call with query:", queryParams);
       const response = await api.get(`/products${queryParams}`);
       
       if (response.success && response.data) {

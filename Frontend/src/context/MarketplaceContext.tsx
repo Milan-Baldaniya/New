@@ -4,6 +4,7 @@ import { orderService } from "@/services/orderService";
 import { toast } from "@/components/ui/use-toast";
 import { getSocket, placeBid as emitBid } from "@/lib/socket";
 import { useAuth } from "@/context/AuthContext";
+import { stripeService } from "@/services/stripeService";
 
 export interface Product {
   id: string;
@@ -17,6 +18,7 @@ export interface Product {
   quantity: number;
   unit: string;
   harvestDate?: string;
+  isOrganic?: boolean;
   organic: boolean;
   bidding: boolean;
   startingBid?: number;
@@ -55,8 +57,9 @@ interface MarketplaceContextType {
   updateCartItemQuantity: (productId: string, quantity: number) => void;
   clearCart: () => void;
   placeBid: (productId: string, amount: number) => Promise<Product | null>;
-  createOrder: () => Promise<string | null>;
+  createOrder: (paymentIntentId?: string) => Promise<string | null>;
   fetchOrders: () => Promise<void>;
+  processPayment: (amount: number) => Promise<{ clientSecret: string, paymentIntentId: string } | null>;
 }
 
 const MarketplaceContext = createContext<MarketplaceContextType | undefined>(undefined);
@@ -249,29 +252,50 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     setIsLoading(true);
     setError(null);
     try {
-      console.log("Fetching products with filters:", filters);
+      console.log("Original filters:", filters);
+      
+      // Normalize filter properties for API compatibility
+      const normalizedFilters: any = { ...filters };
+      
+      // Handle organic/isOrganic conversion 
+      if (normalizedFilters?.organic !== undefined && normalizedFilters?.isOrganic === undefined) {
+        normalizedFilters.isOrganic = normalizedFilters.organic;
+        delete normalizedFilters.organic;
+      }
+      
+      // Handle category case-sensitivity (backend expects lowercase categories)
+      if (normalizedFilters?.category) {
+        normalizedFilters.category = normalizedFilters.category.toLowerCase();
+      }
+      
+      // Handle price filters
+      if (normalizedFilters?.minPrice !== undefined || normalizedFilters?.maxPrice !== undefined) {
+        console.log(`Price range filter: $${normalizedFilters.minPrice} - $${normalizedFilters.maxPrice}`);
+      }
+      
+      console.log("Normalized filters:", normalizedFilters);
       
       // Special case for farmer products
-      if (filters?.farmer) {
-        console.log(`Fetching products for farmer ${filters.farmer}`);
+      if (normalizedFilters?.farmer) {
+        console.log(`Fetching products for farmer ${normalizedFilters.farmer}`);
         
         // Use the dedicated endpoint for farmer products
         let farmerProducts;
         
         try {
           // Try to get farmer products directly
-          farmerProducts = await productService.getFarmerProducts(filters.farmer);
-          console.log(`Retrieved ${farmerProducts.length} products for farmer ${filters.farmer}`);
+          farmerProducts = await productService.getFarmerProducts(normalizedFilters.farmer);
+          console.log(`Retrieved ${farmerProducts.length} products for farmer ${normalizedFilters.farmer}`);
         } catch (err) {
           console.error("Error using getFarmerProducts endpoint:", err);
           
           // Fallback to regular endpoint with farmer filter
-          farmerProducts = await productService.getProducts({ farmer: filters.farmer });
+          farmerProducts = await productService.getProducts({ farmer: normalizedFilters.farmer });
           console.log(`Retrieved ${farmerProducts.length} products using regular endpoint with farmer filter`);
         }
         
         // Filter for auctions if requested
-        if (filters.isAuction) {
+        if (normalizedFilters.isAuction) {
           const auctionProducts = farmerProducts.filter(p => p.bidding === true);
           console.log(`Filtered to ${auctionProducts.length} auction products`);
           setProducts(auctionProducts);
@@ -284,7 +308,8 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
         setFeaturedProducts(featured);
       } else {
         // Regular product fetching
-        const data = await productService.getProducts(filters);
+        const data = await productService.getProducts(normalizedFilters);
+        console.log(`Retrieved ${data.length} products with filters:`, normalizedFilters);
         setProducts(data);
 
         // Set featured products (could be based on different criteria)
@@ -553,7 +578,7 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }
   };
 
-  const createOrder = async (): Promise<string | null> => {
+  const createOrder = async (paymentIntentId?: string): Promise<string | null> => {
     if (cart.length === 0) {
       toast({
         title: "Cannot create order",
@@ -564,7 +589,7 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }
 
     try {
-      const orderId = await orderService.createOrder(cart);
+      const orderId = await orderService.createOrder(cart, paymentIntentId);
       clearCart();
       
       toast({
@@ -577,6 +602,33 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
       toast({
         title: "Order failed",
         description: "There was an error processing your order. Please try again.",
+        variant: "destructive",
+      });
+      return null;
+    }
+  };
+
+  const processPayment = async (amount: number) => {
+    try {
+      // Calculate amount in cents (Stripe requires amounts in smallest currency unit)
+      const amountInCents = Math.round(amount * 100);
+      
+      // Create a payment intent through our service
+      const paymentIntent = await stripeService.createPaymentIntent({
+        amount: amountInCents,
+        currency: 'usd',
+        description: 'Payment for order'
+      });
+      
+      return {
+        clientSecret: paymentIntent.clientSecret,
+        paymentIntentId: paymentIntent.id
+      };
+    } catch (error) {
+      console.error("Error processing payment:", error);
+      toast({
+        title: "Payment processing failed",
+        description: "There was an error processing your payment. Please try again.",
         variant: "destructive",
       });
       return null;
@@ -612,6 +664,7 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     placeBid,
     createOrder,
     fetchOrders,
+    processPayment,
   };
 
   return <MarketplaceContext.Provider value={value}>{children}</MarketplaceContext.Provider>;

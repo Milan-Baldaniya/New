@@ -32,6 +32,17 @@ const categories = [
   "Honey",
 ];
 
+// Backend category mapping - maps UI categories to backend values
+const categoryMapping: Record<string, string> = {
+  "Fruits": "fruits",
+  "Vegetables": "vegetables",
+  "Dairy & Eggs": "dairy",
+  "Meat": "meat", 
+  "Herbs": "other",
+  "Grains": "grains",
+  "Honey": "other"
+};
+
 const Marketplace = () => {
   const { products, fetchProducts, isLoading } = useMarketplace();
   const [searchQuery, setSearchQuery] = useState("");
@@ -61,11 +72,12 @@ const Marketplace = () => {
     }
     
     if (selectedCategory && selectedCategory !== "All Categories") {
-      filters.category = selectedCategory;
+      // Map UI category to backend category
+      filters.category = categoryMapping[selectedCategory] || selectedCategory.toLowerCase();
     }
     
     if (organicOnly) {
-      filters.organic = true;
+      filters.isOrganic = true;
     }
     
     if (priceRange[0] > 0 || priceRange[1] < 100) {
@@ -73,6 +85,7 @@ const Marketplace = () => {
       filters.maxPrice = priceRange[1];
     }
     
+    console.log("Applying filters:", filters);
     fetchProducts(filters);
   }, [searchQuery, selectedCategory, organicOnly, priceRange, fetchProducts]);
   
