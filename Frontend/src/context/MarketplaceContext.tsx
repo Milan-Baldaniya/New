@@ -99,12 +99,12 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     localStorage.setItem('cart', JSON.stringify(cart));
   }, [cart]);
 
-  // Listen for bid updates from socket
+  // Listen for bid updates from socket and global events
   useEffect(() => {
     // Get the socket instance
     const socket = getSocket();
     
-    // Handle incoming bid updates
+    // Handle incoming bid updates from socket
     const handleBidUpdate = (data: any) => {
       const { auctionId, amount, bidder } = data;
       console.log(`MARKETPLACE CONTEXT: Received bid update for ${auctionId}: $${amount} by ${bidder?.name || 'Unknown'}`);
@@ -144,6 +144,19 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // Add socket event listener
     socket.on('auction:bid', handleBidUpdate);
     
+    // Also listen for global events (for cross-component updates)
+    const handleGlobalBidEvent = (event: any) => {
+      if (event && event.detail) {
+        const data = event.detail;
+        if (data.auctionId && data.amount) {
+          handleBidUpdate(data);
+        }
+      }
+    };
+    
+    // Add global event listener for auction:bid events
+    window.addEventListener('auction:bid', handleGlobalBidEvent);
+    
     // Listen for global product updates
     const handleProductUpdate = (event: any) => {
       if (event && event.detail && event.detail.product) {
@@ -178,20 +191,106 @@ export const MarketplaceProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // Clean up listeners on unmount
     return () => {
       socket.off('auction:bid', handleBidUpdate);
+      window.removeEventListener('auction:bid', handleGlobalBidEvent);
       window.removeEventListener('farm:productUpdated', handleProductUpdate);
     };
   }, []);
+
+  // Add a periodic refresh for auction data
+  useEffect(() => {
+    // Only run if there are products in state
+    if (products.length === 0) return;
+    
+    // Find auction products
+    const auctionProducts = products.filter(p => p.bidding);
+    if (auctionProducts.length === 0) return;
+    
+    console.log(`MARKETPLACE CONTEXT: Setting up periodic refresh for ${auctionProducts.length} auctions`);
+    
+    // Set up interval to refresh auction data
+    const refreshInterval = setInterval(async () => {
+      try {
+        // Refresh each auction product
+        for (const auction of auctionProducts) {
+          try {
+            const freshData = await productService.getProductById(auction.id);
+            if (freshData) {
+              // Update the product in state
+              setProducts(prevProducts => 
+                prevProducts.map(product => 
+                  product.id === freshData.id
+                    ? freshData
+                    : product
+                )
+              );
+              
+              // Also update featured products
+              setFeaturedProducts(prevFeatured => 
+                prevFeatured.map(product => 
+                  product.id === freshData.id
+                    ? freshData
+                    : product
+                )
+              );
+            }
+          } catch (error) {
+            console.error(`Error refreshing auction ${auction.id}:`, error);
+          }
+        }
+      } catch (error) {
+        console.error("Error during auction refresh:", error);
+      }
+    }, 60000); // Refresh every minute
+    
+    return () => clearInterval(refreshInterval);
+  }, [products]);
 
   const fetchProducts = useCallback(async (filters?: any) => {
     setIsLoading(true);
     setError(null);
     try {
-      const data = await productService.getProducts(filters);
-      setProducts(data);
+      console.log("Fetching products with filters:", filters);
+      
+      // Special case for farmer products
+      if (filters?.farmer) {
+        console.log(`Fetching products for farmer ${filters.farmer}`);
+        
+        // Use the dedicated endpoint for farmer products
+        let farmerProducts;
+        
+        try {
+          // Try to get farmer products directly
+          farmerProducts = await productService.getFarmerProducts(filters.farmer);
+          console.log(`Retrieved ${farmerProducts.length} products for farmer ${filters.farmer}`);
+        } catch (err) {
+          console.error("Error using getFarmerProducts endpoint:", err);
+          
+          // Fallback to regular endpoint with farmer filter
+          farmerProducts = await productService.getProducts({ farmer: filters.farmer });
+          console.log(`Retrieved ${farmerProducts.length} products using regular endpoint with farmer filter`);
+        }
+        
+        // Filter for auctions if requested
+        if (filters.isAuction) {
+          const auctionProducts = farmerProducts.filter(p => p.bidding === true);
+          console.log(`Filtered to ${auctionProducts.length} auction products`);
+          setProducts(auctionProducts);
+        } else {
+          setProducts(farmerProducts);
+        }
+        
+        // Set featured products
+        const featured = farmerProducts.filter(p => p.organic && p.quantity > 10).slice(0, 6);
+        setFeaturedProducts(featured);
+      } else {
+        // Regular product fetching
+        const data = await productService.getProducts(filters);
+        setProducts(data);
 
-      // Set featured products (could be based on different criteria)
-      const featured = data.filter(p => p.organic && p.quantity > 10).slice(0, 6);
-      setFeaturedProducts(featured);
+        // Set featured products (could be based on different criteria)
+        const featured = data.filter(p => p.organic && p.quantity > 10).slice(0, 6);
+        setFeaturedProducts(featured);
+      }
     } catch (error) {
       console.error("Error fetching products:", error);
       setError("Failed to fetch products. Please try again later.");

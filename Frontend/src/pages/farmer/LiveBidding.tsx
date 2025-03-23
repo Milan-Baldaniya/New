@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useMarketplace } from "@/context/MarketplaceContext";
@@ -16,9 +16,9 @@ import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
-import { Clock, Gavel, Users, UserCheck, ArrowRight, AlertCircle, Bell, DollarSign, TrendingUp, RefreshCw } from "lucide-react";
+import { Clock, Gavel, Users, UserCheck, ArrowRight, AlertCircle, Bell, DollarSign, TrendingUp, RefreshCw, AlertTriangle } from "lucide-react";
 import { Product, productService } from "@/services/productService";
-import { getSocket, emitBid, syncAuctionState, broadcastBid } from "@/lib/socket";
+import { getSocket, emitBid, syncAuctionState, broadcastBid, closeSocket, createSocket, joinAuction, getSocketUrl } from "@/lib/socket";
 import { AnimatePresence, motion } from "framer-motion";
 import { formatCurrency } from "@/lib/utils";
 
@@ -49,10 +49,33 @@ const logEvent = (type, data) => {
     // Ignore errors in debug logging
   }
   
-  // Use the window.logEvent if available (for debug panel)
-  if (window.logEvent) {
-    window.logEvent(type, data);
-  }
+  // Skip calling window.logEvent to prevent recursion
+  // The window.logEvent is set by the debug panel and would call back into this
+};
+
+// Add this function after the logEvent function
+const debugAuctionState = () => {
+  console.group('===== Auction State Debug =====');
+  console.log('User:', user);
+  console.log('Is Authenticated:', isAuthenticated);
+  console.log('Loading State:', loading);
+  console.log('Products Array Length:', products?.length);
+  console.log('Auction Products:', auctionProducts);
+  console.log('Active Auctions:', activeAuctions);
+  console.log('localStorage recentlyViewedAuctions:', localStorage.getItem('recentlyViewedAuctions'));
+  console.log('localStorage currentViewingAuctionId:', localStorage.getItem('currentViewingAuctionId'));
+  console.log('Socket Connected:', getSocket().connected);
+  console.groupEnd();
+};
+
+// Create a standalone function to get socket info
+const getSocketInfo = () => {
+  const socket = getSocket();
+  return {
+    connected: socket?.connected || false,
+    id: socket?.id || null,
+    url: getSocketUrl()
+  };
 };
 
 const LiveBidding = () => {
@@ -332,6 +355,211 @@ const LiveBidding = () => {
     }
   };
 
+  // Function to directly fetch auction by ID for emergency use
+  const fetchAuctionDirectly = async (auctionId) => {
+    logEvent('fetch_auction_direct', { auctionId });
+    
+    try {
+      // Try to fetch the product directly
+      const result = await productService.getProductById(auctionId);
+      
+      if (result) {
+        logEvent('fetch_auction_success', { auctionId });
+        
+        // Manually add it to all relevant state arrays
+        setAuctionProducts(prev => {
+          // Check if already exists
+          const exists = prev.some(p => p.id === auctionId);
+          if (exists) {
+            // Update existing product
+            return prev.map(p => p.id === auctionId ? result : p);
+          } else {
+            // Add new product
+            return [...prev, result];
+          }
+        });
+        
+        // Categorize based on dates
+        const now = new Date();
+        const startDate = new Date(result.startBidTime || result.createdAt);
+        const endDate = new Date(result.endBidTime || '9999-12-31');
+        
+        if (startDate <= now && endDate > now) {
+          // This is an active auction
+          setActiveAuctions(prev => {
+            const exists = prev.some(p => p.id === auctionId);
+            return exists ? prev.map(p => p.id === auctionId ? result : p) : [...prev, result];
+          });
+        }
+        
+        toast({
+          title: "Auction Loaded",
+          description: `Successfully loaded auction: ${result.name}`,
+        });
+        
+        return result;
+      }
+    } catch (error) {
+      logEvent('fetch_auction_error', { auctionId, error: error.message });
+      console.error(`Error directly fetching auction ${auctionId}:`, error);
+      
+      toast({
+        title: "Failed to Load Auction",
+        description: "Could not retrieve auction data",
+        variant: "destructive",
+      });
+    }
+    
+    return null;
+  };
+
+  // Update the emergencyRecoverAuctions function
+  const emergencyRecoverAuctions = async () => {
+    logEvent("emergency_recover", "Starting emergency auction recovery");
+    
+    // Try multiple methods to find and recover auctions
+    let recoveredAuction = false;
+    
+    try {
+      // First check localStorage for current auction ID
+      const currentAuctionId = localStorage.getItem('currentViewingAuctionId');
+      
+      if (currentAuctionId) {
+        logEvent("emergency_recover_direct", { id: currentAuctionId });
+        toast({
+          title: "Recovering auction",
+          description: "Found recently viewed auction in storage",
+        });
+        
+        try {
+          // First approach: Direct API call with retry
+          for (let attempt = 0; attempt < 3 && !recoveredAuction; attempt++) {
+            try {
+              const auction = await productService.getProductById(currentAuctionId);
+              
+              if (auction && auction.bidding) {
+                // Successfully recovered auction
+                setAuctionProducts([auction]);
+                logEvent("emergency_recover_success", { source: "localStorage direct", id: currentAuctionId });
+                toast({
+                  title: "Auction recovered",
+                  description: `Found auction: ${auction.name}`,
+                });
+                recoveredAuction = true;
+                break;
+              }
+            } catch (err) {
+              console.error(`Recovery attempt ${attempt + 1} failed:`, err);
+              await new Promise(resolve => setTimeout(resolve, 500)); // Short delay between retries
+            }
+          }
+        } catch (error) {
+          console.error("Error recovering from localStorage:", error);
+        }
+      }
+      
+      // If direct recovery failed, try recovering from recently viewed auctions
+      if (!recoveredAuction) {
+        try {
+          const recentAuctions = localStorage.getItem('recentlyViewedAuctions');
+          
+          if (recentAuctions) {
+            const auctionIds = JSON.parse(recentAuctions);
+            
+            if (auctionIds && auctionIds.length > 0) {
+              logEvent("emergency_recover_recent", { ids: auctionIds });
+              
+              // Try each auction ID one by one
+              for (const auctionId of auctionIds) {
+                try {
+                  const auction = await productService.getProductById(auctionId);
+                  
+                  if (auction && auction.bidding) {
+                    // Successfully recovered auction
+                    setAuctionProducts(prev => [...prev, auction]);
+                    logEvent("emergency_recover_success", { source: "recentAuctions", id: auctionId });
+                    
+                    recoveredAuction = true;
+                  }
+                } catch (err) {
+                  console.error(`Error recovering auction ${auctionId}:`, err);
+                }
+              }
+              
+              if (recoveredAuction) {
+                toast({
+                  title: "Auctions recovered",
+                  description: "Found auctions from your recently viewed list",
+                });
+              }
+            }
+          }
+        } catch (error) {
+          console.error("Error recovering from recent auctions:", error);
+        }
+      }
+      
+      // If still no success, try a different approach
+      if (!recoveredAuction && user?.id) {
+        try {
+          // Force refresh without filters to get all products
+          await fetchProducts();
+          
+          // Filter for auctions manually
+          const userAuctions = products.filter(p => p.bidding && p.farmerId === user.id);
+          
+          if (userAuctions.length > 0) {
+            setAuctionProducts(userAuctions);
+            logEvent("emergency_recover_success", { source: "general_fetch", count: userAuctions.length });
+            
+            toast({
+              title: "Auctions recovered",
+              description: `Found ${userAuctions.length} active auctions`,
+            });
+            
+            recoveredAuction = true;
+          }
+        } catch (error) {
+          console.error("Error recovering using general fetch:", error);
+        }
+      }
+      
+      // As a last resort, try repairing socket connections
+      try {
+        logEvent("socket_repair", "Repairing socket connection");
+        closeSocket();
+        await new Promise(resolve => setTimeout(resolve, 500));
+        createSocket(true); // Force new socket
+        
+        // Set up socket listeners again
+        setupSocketListeners();
+        
+        if (!recoveredAuction) {
+          logEvent("emergency_recover_failed", "All recovery methods failed");
+          
+          toast({
+            title: "Recovery failed",
+            description: "Could not recover any auctions. Please try refreshing the page.",
+            variant: "destructive",
+          });
+        }
+      } catch (socketError) {
+        console.error("Socket repair failed:", socketError);
+      }
+    } catch (error) {
+      console.error("Error in emergency recovery:", error);
+      logEvent("emergency_recover_error", { error: error.message });
+      
+      toast({
+        title: "Recovery failed",
+        description: "An error occurred during recovery",
+        variant: "destructive",
+      });
+    }
+    
+    return recoveredAuction;
+  };
+
   // Fetch farmer's auction products
   useEffect(() => {
     const loadProducts = async () => {
@@ -347,7 +575,11 @@ const LiveBidding = () => {
 
       try {
         // Only fetch products created by this farmer that are auctions
+        console.log('Fetching auction products for farmer:', user.id);
+        debugAuctionState(); // Add debug logging
         await fetchProducts({ farmer: user.id, isAuction: true });
+        console.log('Fetch products completed');
+        setTimeout(debugAuctionState, 1000); // Debug log after fetch
       } catch (error) {
         console.error("Failed to fetch auction products:", error);
         toast({
@@ -700,16 +932,16 @@ const LiveBidding = () => {
       setLiveData(prev => {
         const auctionData = prev[auctionId] || { participants: 0, recentBids: [] };
         return {
-          ...prev,
-          [auctionId]: {
+        ...prev,
+        [auctionId]: {
             ...auctionData,
             participants: participantCount || auctionData.participants
-          }
+        }
         };
-      });
+    });
     };
 
-    socket.off("auction:update");
+      socket.off("auction:update");
     socket.on("auction:update", handleParticipantUpdate);
     
     // Ensure socket connection
@@ -897,25 +1129,25 @@ const LiveBidding = () => {
           {product.images && product.images.length > 0 && (
             <div className="mb-3">
               <AspectRatio ratio={16 / 9}>
-                <img 
-                  src={product.images[0]} 
-                  alt={product.name} 
+                <img
+                  src={product.images[0]}
+                  alt={product.name}
                   className="rounded-md object-cover w-full h-full"
                 />
-              </AspectRatio>
-            </div>
+            </AspectRatio>
+          </div>
           )}
           
           <div className="flex justify-between items-center mb-3">
-            <div>
+              <div>
               <p className="text-xs text-gray-500">Starting Bid</p>
               <p className="font-medium">{formatCurrency(product.startingBid)}</p>
-            </div>
-            <div>
+              </div>
+              <div>
               <p className="text-xs text-gray-500">Current Bid</p>
               <p className="font-bold text-green-600">{formatCurrency(currentBid)}</p>
-            </div>
-          </div>
+              </div>
+                </div>
           
           {auctionData.recentBids.length > 0 && (
             <div className="mb-3">
@@ -925,10 +1157,10 @@ const LiveBidding = () => {
                   <div key={index} className="flex justify-between items-center py-1">
                     <span className="font-medium truncate">{bid.bidder}</span>
                     <span>{formatCurrency(bid.amount)}</span>
-                  </div>
+              </div>
                 ))}
               </div>
-            </div>
+                </div>
           )}
           
           <div className="grid grid-cols-1 gap-2">
@@ -951,8 +1183,8 @@ const LiveBidding = () => {
                 Test Bid
               </Button>
             )}
-          </div>
-        </div>
+              </div>
+            </div>
       </div>
     );
   };
@@ -962,10 +1194,70 @@ const LiveBidding = () => {
     const [isSyncing, setIsSyncing] = useState(false);
     
     const handleSync = async () => {
-      logEvent('sync_button_clicked', 'User manually requested bid synchronization');
+      logEvent("sync_manual", "Manual sync button clicked");
+      
+      // First, check the socket connection and reconnect if needed
+      const socket = getSocket();
+      if (!socket.connected) {
+        logEvent("sync_reconnect_socket", "Reconnecting socket during sync");
+        socket.connect();
+        // Short delay to allow connection
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
+      // Set up socket listeners explicitly
+      setupSocketListeners();
+      
+      // Force reload all auctions directly from API
       setIsSyncing(true);
+      
       try {
-        await syncBids();
+        // Clear existing auction data to force a clean reload
+        setAuctionProducts([]);
+        
+        if (user?.id) {
+          logEvent("sync_fetch_products", { userId: user.id });
+          
+          // Force a complete reload from the server
+          await fetchProducts({ farmer: user.id, isAuction: true, forceRefresh: true });
+          
+          // Then fetch farmer auctions directly with a fresh call
+          const freshAuctions = await productService.getFarmerProducts(user.id, { isAuction: true, timestamp: Date.now() });
+          logEvent("sync_received_fresh_data", { count: freshAuctions.length });
+          
+          if (freshAuctions && freshAuctions.length > 0) {
+            debugAuctionState();
+            setAuctionProducts(freshAuctions);
+            
+            toast({
+              title: "Sync complete",
+              description: `Found ${freshAuctions.length} active auctions`,
+            });
+          } else {
+            // Try to recover auctions if none were found through normal means
+            debugAuctionState();
+            logEvent("sync_no_auctions_found", "No auctions found, trying emergency recovery");
+            
+            // Try emergency recovery
+            await emergencyRecoverAuctions();
+          }
+        }
+      } catch (error) {
+        console.error("Error during sync:", error);
+        logEvent("sync_error", { error: error.message });
+        
+        toast({
+          title: "Sync failed",
+          description: "Could not refresh auction data",
+          variant: "destructive",
+        });
+        
+        // Try emergency recovery even after error
+        try {
+          await emergencyRecoverAuctions();
+        } catch (recoveryError) {
+          console.error("Recovery also failed:", recoveryError);
+        }
       } finally {
         setIsSyncing(false);
       }
@@ -977,31 +1269,42 @@ const LiveBidding = () => {
           <div className="flex items-center">
             <AlertCircle className="h-5 w-5 text-amber-600 mr-2" />
             <div>
-              <h3 className="font-medium text-amber-800">Not seeing latest bids?</h3>
-              <p className="text-sm text-amber-700">Use the sync button to manually fetch the latest bid data</p>
+              <h3 className="font-medium text-amber-800">Not seeing latest bids or auctions?</h3>
+              <p className="text-sm text-amber-700">Use the sync button to manually fetch the latest data</p>
+                    </div>
+                </div>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleSync}
+              disabled={isSyncing}
+              className="bg-white text-amber-700 border-amber-300 hover:bg-amber-100 hover:text-amber-800"
+            >
+              {isSyncing ? (
+                <>
+                  <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
+                  Syncing...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                  Sync Bids Now
+                </>
+              )}
+            </Button>
+              <Button 
+                variant="outline" 
+              size="sm"
+              onClick={emergencyRecoverAuctions}
+              className="bg-white text-red-700 border-red-300 hover:bg-red-50"
+              >
+              <AlertCircle className="h-4 w-4 mr-2" />
+              Emergency Recovery
+              </Button>
             </div>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleSync}
-            disabled={isSyncing}
-            className="bg-white text-amber-700 border-amber-300 hover:bg-amber-100 hover:text-amber-800"
-          >
-            {isSyncing ? (
-              <>
-                <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
-                Syncing...
-              </>
-            ) : (
-              <>
-                <RefreshCw className="h-4 w-4 mr-2" />
-                Sync Bids Now
-              </>
-            )}
-          </Button>
         </div>
-      </div>
     );
   };
 
@@ -1028,7 +1331,7 @@ const LiveBidding = () => {
         emptyMessage = "You have no active auctions.";
     }
     
-    return (
+      return (
       <div className="space-y-6">
         {selectedTab === "active" && renderSyncButton()}
         
@@ -1043,7 +1346,7 @@ const LiveBidding = () => {
                 onClick={() => navigate("/farmer/products/new")}
               >
                 Create an auction product
-              </Button>
+            </Button>
             )}
           </div>
         ) : (
@@ -1051,8 +1354,8 @@ const LiveBidding = () => {
             {productsToShow.map(product => renderAuctionCard(product))}
           </div>
         )}
-      </div>
-    );
+        </div>
+      );
   };
   
   // Render statistics cards
@@ -1359,93 +1662,324 @@ const LiveBidding = () => {
 
   // Add this new component for debugging
   const DebugPanel = () => {
-    const [isOpen, setIsOpen] = useState(false);
-    const [events, setEvents] = useState<Array<{
-      type: string;
-      timestamp: string;
-      data: any;
-    }>>([]);
+    const [showDebug, setShowDebug] = useState(false);
+    const [socketState, setSocketState] = useState(getSocketInfo());
+    const [refreshCounter, setRefreshCounter] = useState(0);
     
+    // Update socket state periodically
     useEffect(() => {
-      const originalLogEvent = window.console.log;
-      
-      // Override logEvent to capture debug info
-      const captureEvent = (type, data) => {
-        const timestamp = new Date().toISOString();
-        setEvents(prev => [{
-          type,
-          timestamp,
-          data: typeof data === 'object' ? JSON.stringify(data) : String(data)
-        }, ...prev].slice(0, 50)); // Keep last 50 events
-        
-        originalLogEvent(`[${timestamp}] FARMER DASHBOARD EVENT - ${type}:`, data);
+      const updateSocketInfo = () => {
+        setSocketState(getSocketInfo());
       };
       
-      // Replace the global logEvent function
-      window.logEvent = captureEvent;
+      updateSocketInfo();
+      const interval = setInterval(updateSocketInfo, 2000);
+      
+      return () => clearInterval(interval);
+    }, []);
+    
+    const captureEvent = (type, data) => {
+      // Prevent recursion - don't call window.logEvent if it's this function
+      // Keep original logging functionality
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] FARMER DASHBOARD EVENT - ${type}:`, data);
+
+      // Also send to server logs for persistent debugging
+      try {
+        const socket = getSocket();
+        if (socket.connected) {
+          socket.emit('debug:log', {
+            component: 'FarmerLiveBidding',
+            timestamp,
+            type,
+            data
+          });
+        }
+      } catch (e) {
+        // Ignore errors in debug logging
+      }
+      
+      // For sync-related events, refresh the debug panel
+      if (type.includes('sync') || type.includes('socket')) {
+        setRefreshCounter(c => c + 1);
+      }
+    };
+
+    // Pass captureEvent to parent safely
+    useEffect(() => {
+      const originalLogEvent = window.logEvent;
+      window.logEvent = (type, data) => {
+        // Only run capture event logic, don't recursively call window.logEvent
+        const timestamp = new Date().toISOString();
+        console.log(`[${timestamp}] FARMER DASHBOARD EVENT - ${type}:`, data);
+        
+        // For sync-related events, refresh the debug panel
+        if (type.includes('sync') || type.includes('socket')) {
+          setRefreshCounter(c => c + 1);
+        }
+      };
       
       return () => {
-        // Restore original if needed
-        window.console.log = originalLogEvent;
+        window.logEvent = originalLogEvent;
       };
     }, []);
     
-    if (!isOpen) {
+    const handleForceReconnect = () => {
+      logEvent("debug_reconnect", "Forcing socket reconnection from debug panel");
+      closeSocket();
+      
+      // Force new socket instance
+      const newSocket = createSocket(true);
+      
+      // Update state with new socket info
+      setSocketState(getSocketInfo());
+      
+      // Setup listeners
+      setupSocketListeners();
+      
+      toast({
+        title: "Socket reconnected",
+        description: "Forced socket reconnection"
+      });
+    };
+    
+    const handleFullRefresh = async () => {
+      try {
+        await handleSync();
+        setRefreshCounter(c => c + 1);
+      } catch (e) {
+        console.error("Debug refresh error:", e);
+      }
+    };
+    
+    const handleClearLocalStorage = () => {
+      // Clear only auction-related items
+      const auctionKeys = [
+        'recentlyViewedAuctions',
+        'currentViewingAuctionId'
+      ];
+      
+      auctionKeys.forEach(key => localStorage.removeItem(key));
+      
+      toast({
+        title: "Storage cleared",
+        description: "Cleared auction-related localStorage items"
+      });
+    };
+    
+    if (!showDebug) {
       return (
-        <Button
-          variant="ghost"
-          size="sm"
-          className="fixed bottom-4 right-4 bg-gray-100 text-gray-700 border border-gray-300 p-2 rounded-md"
-          onClick={() => setIsOpen(true)}
-        >
-          Debug
-        </Button>
+        <div className="fixed bottom-4 right-4 z-50">
+          <Button 
+            variant="outline" 
+            size="sm"
+            onClick={() => setShowDebug(true)}
+            className="bg-gray-200 opacity-70 hover:opacity-100"
+          >
+            Debug
+          </Button>
+        </div>
       );
     }
     
     return (
-      <div className="fixed bottom-0 right-0 w-full md:w-1/2 lg:w-1/3 h-2/3 bg-gray-800 text-gray-200 z-50 rounded-t-lg overflow-hidden shadow-lg">
-        <div className="flex justify-between items-center bg-gray-900 p-2">
-          <div className="text-sm font-bold">LiveBidding Debug Panel</div>
-          <div className="flex gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 p-1 text-xs text-gray-400 hover:text-white"
-              onClick={() => setEvents([])}
-            >
-              Clear
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 p-1 text-xs text-gray-400 hover:text-white"
-              onClick={() => setIsOpen(false)}
-            >
-              Close
-            </Button>
-          </div>
+      <div className="fixed bottom-4 right-4 z-50 w-96 bg-white border border-gray-300 rounded-md shadow-lg p-4">
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="font-bold">Debug Panel</h3>
+          <Button variant="ghost" size="sm" onClick={() => setShowDebug(false)}>
+            Close
+          </Button>
         </div>
         
-        <div className="h-full overflow-auto p-2 text-xs font-mono">
-          {events.length === 0 ? (
-            <div className="text-gray-500 text-center p-4">No events captured yet</div>
-          ) : (
-            events.map((event, i) => (
-              <div key={i} className="mb-2 border-b border-gray-700 pb-1">
-                <div className="flex justify-between">
-                  <span className={`font-semibold ${event.type.includes('error') ? 'text-red-400' : 'text-green-400'}`}>
-                    {event.type}
-                  </span>
-                  <span className="text-gray-500">{new Date(event.timestamp).toLocaleTimeString()}</span>
-                </div>
-                <div className="whitespace-pre-wrap text-gray-300 mt-1">{event.data}</div>
+        <div className="space-y-3 text-xs">
+          <div className="grid grid-cols-2 gap-2">
+            <div className="bg-gray-100 p-2 rounded">
+              <div className="font-semibold mb-1">Socket Status</div>
+              <div className={`flex items-center ${socketState.connected ? 'text-green-600' : 'text-red-600'}`}>
+                <div className={`w-2 h-2 rounded-full mr-1 ${socketState.connected ? 'bg-green-600' : 'bg-red-600'}`}></div>
+                {socketState.connected ? 'Connected' : 'Disconnected'}
               </div>
-            ))
-          )}
+              <div className="text-gray-600 mt-1">
+                ID: {socketState.id || 'None'}
+              </div>
+            </div>
+            
+            <div className="bg-gray-100 p-2 rounded">
+              <div className="font-semibold mb-1">Auctions</div>
+              <div>Count: {auctionProducts.length}</div>
+              <div>Syncing: {isSyncing ? 'Yes' : 'No'}</div>
+            </div>
+          </div>
+          
+          <div className="bg-gray-100 p-2 rounded">
+            <div className="font-semibold mb-1">LocalStorage</div>
+            <div className="text-xs overflow-hidden text-ellipsis">
+              CurrentID: {localStorage.getItem('currentViewingAuctionId') || 'None'}
+            </div>
+            <div className="text-xs overflow-hidden text-ellipsis">
+              Recent: {localStorage.getItem('recentlyViewedAuctions') || '[]'}
+            </div>
+          </div>
+          
+          <div className="grid grid-cols-3 gap-2">
+            <Button size="sm" variant="outline" onClick={handleForceReconnect}>
+              Reconnect Socket
+            </Button>
+            <Button size="sm" variant="outline" onClick={handleFullRefresh}>
+              Force Sync
+            </Button>
+            <Button size="sm" variant="outline" onClick={handleClearLocalStorage}>
+              Clear Storage
+            </Button>
+          </div>
+          
+          <Button size="sm" variant="outline" onClick={emergencyRecoverAuctions} className="w-full">
+            Emergency Recovery
+          </Button>
         </div>
       </div>
     );
+  };
+
+  // Add this useEffect after the other useEffects to automatically try to recover auctions when loaded
+  useEffect(() => {
+    // Check if we have active auctions already
+    if (activeAuctions.length === 0 && !loading) {
+      console.log("No active auctions found, attempting emergency recovery...");
+      
+      // Try to extract auction ID from URL in other tab
+      const url = window.location.href;
+      if (url.includes('live-bidding/')) {
+        const urlAuctionId = url.split('live-bidding/')[1].split('?')[0].split('#')[0];
+        console.log(`Found auction ID in URL: ${urlAuctionId}`);
+        fetchAuctionDirectly(urlAuctionId);
+      } else {
+        // Check if we can get the auction ID from the other tab shown in the screenshot
+        try {
+          // Try to get ID from the URL of the other tab directly
+          const pathname = window.location.pathname;
+          console.log("Current pathname:", pathname);
+          
+          if (pathname.includes('dashboard/live-bidding')) {
+            console.log("On dashboard page, checking for visible auction in consumer page...");
+            
+            // Look at localStorage for recently viewed auctions
+            const recentAuctions = localStorage.getItem('recentlyViewedAuctions');
+            if (recentAuctions) {
+              try {
+                const auctionIds = JSON.parse(recentAuctions);
+                if (auctionIds && auctionIds.length > 0) {
+                  console.log("Found recently viewed auctions:", auctionIds);
+                  // Try to fetch the most recent auction
+                  fetchAuctionDirectly(auctionIds[0]);
+                }
+              } catch (e) {
+                console.error("Error parsing recently viewed auctions:", e);
+              }
+            }
+          }
+        } catch (e) {
+          console.error("Error trying to auto-detect auction:", e);
+        }
+      }
+    }
+  }, [activeAuctions.length, loading]);
+
+  // Also call emergencyRecoverAuctions on load if we have no auctions
+  useEffect(() => {
+    if (activeAuctions.length === 0 && !loading && isAuthenticated && user) {
+      // Add a slight delay to allow regular data loading to finish
+      const timer = setTimeout(() => {
+        if (activeAuctions.length === 0) {
+          console.log("No active auctions found after delay, running emergency recovery");
+          emergencyRecoverAuctions();
+        }
+      }, 3000);
+      
+      return () => clearTimeout(timer);
+    }
+  }, [activeAuctions.length, loading, isAuthenticated, user]);
+
+  // Add a function to render a recovery message when there are no active auctions
+  const renderRecoveryMessage = () => {
+    const [showMessage, setShowMessage] = useState(true);
+    
+    // Check if we have evidence of auctions in localStorage
+    const hasStoredAuctions = 
+      localStorage.getItem('currentViewingAuctionId') || 
+      localStorage.getItem('recentlyViewedAuctions');
+    
+    if (!showMessage || activeAuctions.length > 0 || !hasStoredAuctions) {
+      return null;
+    }
+    
+    return (
+      <div className="bg-red-50 border-l-4 border-red-500 p-4 mb-6">
+        <div className="flex">
+          <div className="flex-shrink-0">
+            <AlertTriangle className="h-5 w-5 text-red-500" />
+          </div>
+          <div className="ml-3">
+            <h3 className="text-sm font-medium text-red-800">
+              Active auctions not displaying correctly
+            </h3>
+            <div className="mt-2 text-sm text-red-700">
+              <p>
+                You appear to have auctions that aren't showing up in the dashboard.
+                Click "Emergency Recovery" to attempt to recover your auction data.
+              </p>
+            </div>
+            <div className="mt-4">
+              <div className="flex space-x-3">
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => emergencyRecoverAuctions()}
+                >
+                  Emergency Recovery
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowMessage(false)}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // In the LiveBidding component, add the setupSocketListeners function
+  const setupSocketListeners = () => {
+    const socket = getSocket();
+    
+    // Log connection status
+    logEvent("socket_setup", { connected: socket.connected });
+    
+    if (!socket.connected) {
+      logEvent("socket_reconnect", "Reconnecting socket");
+      socket.connect();
+    }
+    
+    // Socket event handlers
+    socket.on("auction:update", (data) => {
+      logEvent("socket_auction_update", data);
+      handleParticipantUpdate(data);
+    });
+    
+    socket.on("auction:bid", (data) => {
+      logEvent("socket_auction_bid", data);
+      handleBid(data);
+    });
+    
+    return () => {
+      socket.off("auction:update");
+      socket.off("auction:bid");
+    };
   };
 
   return (
@@ -1525,6 +2059,8 @@ const LiveBidding = () => {
           </div>
         </div>
       )}
+      
+      {renderRecoveryMessage()}
       
       {renderStatistics()}
       

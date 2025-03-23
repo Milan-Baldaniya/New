@@ -5,6 +5,8 @@ const DEBUG_MODE = true;
 
 // Socket instance
 let socket: Socket | null = null;
+let connectionAttempts = 0;
+let socketUrl = null;
 
 // User information
 let currentUserId: string | null = null;
@@ -15,92 +17,116 @@ let currentAuctionId: string | null = null;
  * @returns {string} WebSocket server URL
  */
 export function getSocketUrl(): string {
-  // Always use port 5001 for development
-  const defaultUrl = 'http://localhost:5001';
+  if (socketUrl) return socketUrl;
   
-  // Use environment variable in production, fallback to defaultUrl
-  const apiUrl = import.meta.env.VITE_API_URL || defaultUrl;
-  
-  // Ensure we're using port 5001 if it's a localhost URL
-  let finalUrl = apiUrl;
-  if (apiUrl.includes('localhost:5000')) {
-    finalUrl = apiUrl.replace('localhost:5000', 'localhost:5001');
-    console.warn('[Socket] Corrected URL from port 5000 to 5001:', finalUrl);
-  }
-  
-  if (DEBUG_MODE) console.log(`[Socket] Using server URL: ${finalUrl}`);
-  return finalUrl;
+  // Get from environment variable or use default
+  const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:8080";
+  socketUrl = apiUrl;
+  return socketUrl;
 }
 
 /**
  * Create and configure a Socket.io client instance
  * @returns {Socket} Socket.io client instance
  */
-export function createSocket(): Socket {
-  // Close any existing connection
-  if (socket) {
-    if (socket.io.uri.includes('localhost:5000')) {
-      console.warn('[Socket] Detected connection to port 5000, forcibly closing and reconnecting to port 5001');
-      closeSocket();
-    } else if (socket.connected) {
-      if (DEBUG_MODE) console.log('[Socket] Reusing existing connected socket');
-      return socket;
-    } else if (!socket.connected && !socket.connecting) {
-      if (DEBUG_MODE) console.log('[Socket] Socket exists but not connected or connecting, creating new connection');
-      closeSocket();
-    } else {
-      if (DEBUG_MODE) console.log('[Socket] Socket is connecting, reusing existing socket');
-      return socket;
+export function createSocket(forceNew = false): Socket {
+  // Close existing socket if requested
+  if (socket && forceNew) {
+    try {
+      socket.disconnect();
+      socket = null;
+    } catch (e) {
+      console.error("Error closing existing socket:", e);
     }
   }
-
+  
+  // Use singleton pattern
+  if (socket) return socket;
+  
+  // Get socket URL
   const url = getSocketUrl();
-  if (DEBUG_MODE) console.log(`[Socket] Creating new socket connection to ${url}`);
-
-  // Create socket instance with reconnection enabled
-  socket = io(url, {
-    transports: ['polling', 'websocket'], // Try polling first, then websocket - this avoids WebSocket connection failures
-    reconnection: true,
-    reconnectionAttempts: 10,
-    reconnectionDelay: 2000,
-    timeout: 30000,
-    forceNew: true // Force a new connection
-  });
-
-  // Connection event handlers
-  socket.on('connect', () => {
-    console.log(`[Socket] Connected successfully! Socket ID: ${socket.id}`);
-  });
-
-  socket.on('connect_error', (error) => {
-    console.error(`[Socket] Connection error: ${error.message}`);
-    console.log(`[Socket] Connection details: URL=${url}, Transport=${socket.io.engine?.transport?.name || 'unknown'}`);
+  
+  // Create the socket with better reconnection options
+  try {
+    socket = io(url, {
+      reconnection: true,
+      reconnectionAttempts: 10, 
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 20000,
+      autoConnect: true,
+      // Try polling first if websocket fails
+      transports: ['polling', 'websocket']
+    });
     
-    // If we're on websocket and it failed, try polling
-    if (socket.io.engine?.transport?.name === 'websocket') {
-      if (DEBUG_MODE) console.log('[Socket] WebSocket failed, switching to polling transport');
+    // Track connection attempts
+    connectionAttempts = 0;
+    
+    // Add global event listeners
+    socket.on('connect', () => {
+      console.log(`Socket connected: ${socket.id}`);
+      connectionAttempts = 0;
       
-      // Set transports to only use polling
-      socket.io.opts.transports = ['polling'];
+      // Dispatch global event for components to react
+      window.dispatchEvent(new CustomEvent('socket:connected', {
+        detail: { socketId: socket.id }
+      }));
+    });
+    
+    socket.on('connect_error', (error) => {
+      connectionAttempts++;
+      console.error(`Socket connection error (attempt ${connectionAttempts}):`, error.message);
       
-      console.log('[Socket] Switched to polling transport only, reconnecting...');
-    }
-  });
-
-  socket.on('disconnect', (reason) => {
-    console.log(`[Socket] Disconnected: ${reason}`);
-  });
-
-  socket.io.on('reconnect_attempt', (attemptNumber) => {
-    console.log(`[Socket] Reconnection attempt #${attemptNumber}`);
-  });
-
-  // Welcome message from server
-  socket.on('connect:welcome', (data) => {
-    if (DEBUG_MODE) console.log(`[Socket] Welcome message received:`, data);
-  });
-
-  return socket;
+      // Dispatch global event for components to react
+      window.dispatchEvent(new CustomEvent('socket:error', {
+        detail: { error: error.message, attempts: connectionAttempts }
+      }));
+      
+      // If too many failed attempts, force a new socket instance next time
+      if (connectionAttempts >= 5) {
+        console.warn("Too many failed connection attempts, will create new instance on next getSocket");
+        socket = null;
+      }
+    });
+    
+    socket.on('disconnect', (reason) => {
+      console.log(`Socket disconnected: ${reason}`);
+      
+      // Dispatch global event for components to react
+      window.dispatchEvent(new CustomEvent('socket:disconnected', {
+        detail: { reason }
+      }));
+      
+      // If server disconnected us, try to reconnect manually
+      if (reason === 'io server disconnect') {
+        socket.connect();
+      }
+    });
+    
+    // Listen for auction-specific events
+    socket.on('auction:bid', (data) => {
+      console.log("Received auction:bid event:", data);
+      
+      // Broadcast this data globally so any component can react
+      window.dispatchEvent(new CustomEvent('auction:bid', {
+        detail: { ...data }
+      }));
+    });
+    
+    socket.on('auction:update', (data) => {
+      console.log("Received auction:update event:", data);
+      
+      // Broadcast globally
+      window.dispatchEvent(new CustomEvent('auction:update', {
+        detail: { ...data }
+      }));
+    });
+    
+    return socket;
+  } catch (error) {
+    console.error("Error creating socket:", error);
+    return null;
+  }
 }
 
 /**
@@ -108,18 +134,29 @@ export function createSocket(): Socket {
  * @returns {Socket} Socket.io client instance
  */
 export function getSocket(): Socket {
-  return socket || createSocket();
+  if (!socket) {
+    console.log("Creating new socket instance");
+    socket = createSocket();
+  }
+  return socket;
 }
 
 /**
  * Close the socket connection
  */
-export function closeSocket(): void {
+export function closeSocket(): boolean {
   if (socket) {
-    if (DEBUG_MODE) console.log('[Socket] Closing socket connection');
-    socket.disconnect();
-    socket = null;
+    try {
+      socket.disconnect();
+      socket = null;
+      console.log("Socket disconnected and instance cleared");
+      return true;
+    } catch (e) {
+      console.error("Error closing socket:", e);
+      return false;
+    }
   }
+  return true;
 }
 
 /**
@@ -137,63 +174,24 @@ export function setCurrentUser(userId: string): void {
  * @returns {Promise<object>} Promise resolving to join response
  */
 export function joinAuction(auctionId: string): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const socketInstance = getSocket();
-    if (DEBUG_MODE) console.log(`[Socket] Joining auction: ${auctionId}`);
-    
-    // If socket isn't connected, reconnect first
-    if (!socketInstance.connected) {
-      console.log('[Socket] Socket not connected when trying to join auction. Connecting...');
-      socketInstance.connect();
-      
-      // Wait for connection before continuing
-      setTimeout(() => {
-        if (!socketInstance.connected) {
-          console.error('[Socket] Failed to connect socket before joining auction');
-          reject(new Error('Socket connection failed'));
-          return;
-        }
-        attemptJoin();
-      }, 1000);
-    } else {
-      attemptJoin();
-    }
-    
-    function attemptJoin() {
-      // Leave previous auction if any
-      if (currentAuctionId && currentAuctionId !== auctionId) {
-        leaveAuction(currentAuctionId).catch(error => {
-          console.warn(`[Socket] Error leaving previous auction: ${error.message}`);
+  const socket = getSocket();
+  
+  if (!socket.connected) {
+    socket.connect();
+  }
+  
+  return new Promise((resolve) => {
+    // Try both formats for backwards compatibility
+    socket.emit('auction:join', { auctionId }, (response) => {
+      if (response && response.success) {
+        handleSuccessResponse(response);
+      } else {
+        // Try direct ID format
+        socket.emit('auction:join', auctionId, (directResponse) => {
+          handleSuccessResponse(directResponse || { success: false });
         });
       }
-      
-      console.log(`[Socket] Emitting auction:join for auction ${auctionId}`);
-      
-      // Try to join directly with auction ID first - older server format
-      socketInstance.emit('auction:join', auctionId, (response: any) => {
-        if (response && response.success) {
-          handleSuccessResponse(response);
-        } else {
-          // If direct ID failed, try with object format - newer server format
-          console.log('[Socket] Direct ID join failed, trying object format...');
-          socketInstance.emit('auction:join', { auctionId }, (objResponse: any) => {
-            if (objResponse && objResponse.success) {
-              handleSuccessResponse(objResponse);
-            } else {
-              const error = (response?.error || objResponse?.error || 'Failed to join auction');
-              console.error(`[Socket] Error joining auction in both formats: ${error}`);
-              reject(new Error(error));
-            }
-          });
-        }
-      });
-    }
-    
-    function handleSuccessResponse(response: any) {
-      currentAuctionId = auctionId;
-      if (DEBUG_MODE) console.log(`[Socket] Joined auction ${auctionId} with ${response.participantCount} participants`);
-      resolve(response);
-    }
+    });
   });
 }
 
@@ -203,24 +201,13 @@ export function joinAuction(auctionId: string): Promise<any> {
  * @returns {Promise<object>} Promise resolving to leave response
  */
 export function leaveAuction(auctionId: string): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const socketInstance = getSocket();
-    if (DEBUG_MODE) console.log(`[Socket] Leaving auction: ${auctionId}`);
-    
-    socketInstance.emit('auction:leave', auctionId, (response: any) => {
-      if (response && response.success) {
-        if (currentAuctionId === auctionId) {
-          currentAuctionId = null;
-        }
-        if (DEBUG_MODE) console.log(`[Socket] Left auction ${auctionId}`);
-        resolve(response);
-      } else {
-        const error = response?.error || 'Failed to leave auction';
-        console.error(`[Socket] Error leaving auction: ${error}`);
-        reject(new Error(error));
-      }
-    });
-  });
+  const socket = getSocket();
+  
+  if (!socket.connected) return;
+  
+  // Try both formats
+  socket.emit('auction:leave', { auctionId });
+  socket.emit('auction:leave', auctionId);
 }
 
 /**
@@ -231,66 +218,77 @@ export function leaveAuction(auctionId: string): Promise<any> {
  * @returns {Promise<object>} Promise resolving to bid response
  */
 export function placeBid(auctionId: string, amount: number, userId?: string): Promise<any> {
-  return new Promise((resolve, reject) => {
-    // Use provided userId or fall back to currentUserId
-    const bidUserId = userId || currentUserId;
+  const socket = getSocket();
+  
+  if (!socket.connected) {
+    console.log("Socket not connected for bid, connecting...");
+    socket.connect();
     
-    if (!bidUserId) {
-      const error = 'User ID is required to place a bid';
-      console.error(`[Socket] ${error}`);
-      reject(new Error(error));
-      return;
-    }
-    
-    const socketInstance = getSocket();
-    if (DEBUG_MODE) console.log(`[Socket] Placing bid of $${amount} on auction ${auctionId} by user ${bidUserId}`);
-    
-    // Ensure socket is connected before attempting to place bid
-    if (!socketInstance.connected) {
-      console.error(`[Socket] Cannot place bid - socket is not connected`);
-      // Try to reconnect
-      socketInstance.connect();
+    // Wait for connection
+    return new Promise((resolve, reject) => {
+      const checkConnection = setInterval(() => {
+        if (socket.connected) {
+          clearInterval(checkConnection);
+          placeBidDirectly(auctionId, amount, userId);
+        }
+      }, 100);
       
-      // Wait briefly for connection to establish
+      // Timeout after 5 seconds
       setTimeout(() => {
-        if (!socketInstance.connected) {
-          reject(new Error('Socket is not connected. Please try again.'));
-          return;
-        } else {
-          // Now that we're connected, place the bid directly
-          placeBidDirectly();
-        }
-      }, 1000);
-    } else {
-      // Socket is already connected, place bid directly
-      placeBidDirectly();
-    }
+        clearInterval(checkConnection);
+        reject(new Error("Socket connection timed out"));
+      }, 5000);
+    });
+  }
+  
+  return placeBidDirectly(auctionId, amount, userId);
+}
+
+function placeBidDirectly(auctionId: string, amount: number, userId?: string): Promise<any> {
+  // Use provided userId or fall back to currentUserId
+  const bidUserId = userId || currentUserId;
+  
+  if (!bidUserId) {
+    const error = 'User ID is required to place a bid';
+    console.error(`[Socket] ${error}`);
+    return Promise.reject(new Error(error));
+  }
+  
+  if (DEBUG_MODE) console.log(`[Socket] Placing bid of $${amount} on auction ${auctionId} by user ${bidUserId}`);
+  
+  // Create bid data
+  const bidData = {
+    auctionId,
+    amount,
+    userId: bidUserId,
+    bidder: {
+      id: bidUserId,
+      name: "User" // Should be replaced with actual name if available
+    },
+    timestamp: new Date().toISOString()
+  };
+  
+  console.log(`[Socket] Emitting auction:bid with data:`, bidData);
+  
+  return new Promise((resolve, reject) => {
+    // Set timeout for bid response
+    const timeout = setTimeout(() => {
+      reject(new Error("Bid timeout - no response from server"));
+    }, 10000);
     
-    function placeBidDirectly() {
-      // Create bid data
-      const bidData = {
-        auctionId,
-        amount,
-        userId: bidUserId,
-        timestamp: new Date()
-      };
+    // Emit bid with callback
+    socket.emit('auction:bid', bidData, (response) => {
+      clearTimeout(timeout);
       
-      console.log(`[Socket] Emitting auction:bid with data:`, bidData);
-      
-      // Skip status check and emit bid directly
-      socketInstance.emit('auction:bid', bidData, (bidResponse: any) => {
-        console.log(`[Socket] Bid response received:`, bidResponse);
-        
-        if (bidResponse && bidResponse.success) {
-          console.log(`[Socket] Bid placed successfully on auction ${auctionId}: $${amount}`);
-          resolve(bidResponse);
-        } else {
-          const error = bidResponse?.error || 'Failed to place bid';
-          console.error(`[Socket] Error placing bid: ${error}`);
-          reject(new Error(error));
-        }
-      });
-    }
+      if (response && response.success) {
+        console.log(`[Socket] Bid placed successfully on auction ${auctionId}: $${amount}`);
+        resolve(response);
+      } else {
+        const error = response?.error || 'Failed to place bid';
+        console.error(`[Socket] Error placing bid: ${error}`);
+        reject(new Error(error));
+      }
+    });
   });
 }
 
@@ -335,69 +333,9 @@ export function onBid(handler: (data: any) => void): () => void {
 export function checkConnection(): boolean {
   if (DEBUG_MODE) console.log('[Socket] Checking connection status');
   
-  // If no socket exists, create one
-  if (!socket) {
-    if (DEBUG_MODE) console.log('[Socket] No socket instance found, creating new socket');
-    createSocket();
-    return socket?.connected || false;
-  }
-  
-  // Check if socket is connected to the wrong port
-  if (socket.io.uri.includes('localhost:5000')) {
-    console.warn('[Socket] Connection to wrong port detected, recreating socket');
-    closeSocket();
-    createSocket();
-    return socket?.connected || false;
-  }
-  
-  // If socket exists but is not connected, try reconnecting
-  if (!socket.connected) {
-    if (DEBUG_MODE) console.log('[Socket] Socket exists but not connected, attempting to connect');
-    
-    // If socket is already attempting to reconnect, don't interfere
-    if (socket.io.reconnecting) {
-      if (DEBUG_MODE) console.log('[Socket] Reconnection already in progress');
-      return false;
-    }
-    
-    // Check if we've exceeded maximum reconnection attempts
-    if (socket.io._reconnectionAttempts > 3) {
-      if (DEBUG_MODE) console.log('[Socket] Too many reconnection attempts, creating new socket with polling transport');
-      closeSocket(); // Close the current socket
-      
-      // Create a new socket with polling transport only
-      const url = getSocketUrl();
-      socket = io(url, {
-        transports: ['polling'],
-        reconnection: true,
-        reconnectionAttempts: 3,
-        reconnectionDelay: 1000,
-        timeout: 30000,
-        forceNew: true
-      });
-      
-      return socket?.connected || false;
-    }
-    
-    // Force reconnection
-    try {
-      if (DEBUG_MODE) console.log('[Socket] Forcing socket to reconnect');
-      socket.connect();
-      return socket.connected;
-    } catch (error) {
-      console.error('[Socket] Error while reconnecting:', error);
-      
-      // If reconnection fails, try creating a new socket
-      if (DEBUG_MODE) console.log('[Socket] Reconnection failed, creating new socket');
-      closeSocket();
-      createSocket();
-      return socket?.connected || false;
-    }
-  }
-  
-  // Socket exists and is connected
-  if (DEBUG_MODE) console.log('[Socket] Socket connection is active');
-  return true;
+  // Check if socket exists and is connected
+  if (!socket) return false;
+  return socket.connected;
 }
 
 /**
@@ -406,56 +344,42 @@ export function checkConnection(): boolean {
  * @returns {Promise<object|null>} The auction state or null if failed
  */
 export function syncAuctionState(auctionId: string): Promise<any> {
+  const socket = getSocket();
+  
+  if (!socket.connected) {
+    socket.connect();
+    // Wait briefly for connection
+    return new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  
   return new Promise((resolve, reject) => {
     if (!auctionId) {
       reject(new Error('Auction ID is required'));
       return;
     }
     
-    const socket = getSocket();
+    if (DEBUG_MODE) console.log(`[Socket] Syncing auction state for ${auctionId}`);
     
-    // Ensure socket is connected
-    if (!socket.connected) {
-      if (DEBUG_MODE) console.log(`[Socket] Socket not connected, connecting before sync for auction ${auctionId}`);
-      socket.connect();
-      
-      // Wait for connection
-      setTimeout(() => {
-        if (!socket.connected) {
-          console.error(`[Socket] Failed to connect socket when trying to sync auction ${auctionId}`);
-          reject(new Error('Socket connection failed'));
-          return;
+    // First make sure we're in the auction room
+    socket.emit('auction:join', { auctionId }, () => {
+      // Now request the latest state
+      socket.emit('auction:getState', { auctionId }, (response: any) => {
+        if (DEBUG_MODE) console.log(`[Socket] Auction state sync response for ${auctionId}:`, response);
+        
+        if (response && response.success) {
+          resolve(response);
+        } else {
+          // Try direct ID format as fallback
+          socket.emit('auction:getState', auctionId, (directResponse: any) => {
+            if (directResponse && directResponse.success) {
+              resolve(directResponse);
+            } else {
+              reject(new Error('Failed to sync auction state'));
+            }
+          });
         }
-        performSync();
-      }, 1000);
-    } else {
-      performSync();
-    }
-    
-    function performSync() {
-      if (DEBUG_MODE) console.log(`[Socket] Syncing auction state for ${auctionId}`);
-      
-      // First make sure we're in the auction room
-      socket.emit('auction:join', { auctionId }, () => {
-        // Now request the latest state
-        socket.emit('auction:getState', { auctionId }, (response: any) => {
-          if (DEBUG_MODE) console.log(`[Socket] Auction state sync response for ${auctionId}:`, response);
-          
-          if (response && response.success) {
-            resolve(response);
-          } else {
-            // Try direct ID format as fallback
-            socket.emit('auction:getState', auctionId, (directResponse: any) => {
-              if (directResponse && directResponse.success) {
-                resolve(directResponse);
-              } else {
-                reject(new Error('Failed to sync auction state'));
-              }
-            });
-          }
-        });
       });
-    }
+    });
   });
 }
 
@@ -467,44 +391,41 @@ export function syncAuctionState(auctionId: string): Promise<any> {
  * @returns {Promise<boolean>} Whether the broadcast was successful
  */
 export function broadcastBid(auctionId: string, amount: number, bidder: any): Promise<boolean> {
-  return new Promise((resolve) => {
-    if (!auctionId || !amount || !bidder) {
-      console.error('[Socket] Invalid bid data for broadcast');
-      resolve(false);
-      return;
-    }
-    
-    try {
-      // 1. Create comprehensive bid data
-      const bidData = {
-        auctionId,
-        amount,
-        userId: bidder.id || 'anonymous',
-        bidder: typeof bidder === 'object' ? bidder : { id: 'anonymous', name: bidder },
-        timestamp: new Date().toISOString()
-      };
+  const socket = getSocket();
+  
+  // Auto-connect if not connected
+  if (!socket.connected) {
+    socket.connect();
+    // Wait briefly for connection
+    return new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  
+  // Complete bid data
+  const bidData = {
+    auctionId,
+    amount,
+    userId: bidder?.id,
+    bidder,
+    timestamp: new Date().toISOString()
+  };
+  
+  try {
+    // First try the socket emit with callback
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        // If no response in 3 seconds, assume it failed but don't reject
+        resolve(false);
+      }, 3000);
       
-      // 2. Dispatch global event
-      window.dispatchEvent(new CustomEvent('farm:newBid', {
-        detail: { bidData }
-      }));
-      
-      // 3. Emit socket event
-      const socket = getSocket();
-      if (socket.connected) {
-        socket.emit('auction:bid', bidData, (response: any) => {
-          resolve(response && response.success);
-        });
-      } else {
-        // Even if socket fails, we succeed because of the global event
-        resolve(true);
-      }
-    } catch (error) {
-      console.error('[Socket] Error broadcasting bid:', error);
-      // Still return true since the global event should work
-      resolve(true);
-    }
-  });
+      socket.emit('auction:bid', bidData, (response) => {
+        clearTimeout(timeout);
+        resolve(response && response.success);
+      });
+    });
+  } catch (e) {
+    console.error("Error broadcasting bid:", e);
+    return false;
+  }
 }
 
 export default {

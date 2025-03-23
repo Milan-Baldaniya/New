@@ -348,6 +348,37 @@ const LiveBidding = () => {
     };
   }, [id, fetchProductById, navigate, toast]);
   
+  // Store auction ID in localStorage for reference by farmer dashboard
+  useEffect(() => {
+    if (id) {
+      // Store this auction ID in localStorage for cross-reference with farmer dashboard
+      try {
+        // Get existing recently viewed auctions
+        const recentAuctions = localStorage.getItem('recentlyViewedAuctions') || '[]';
+        const auctionIds = JSON.parse(recentAuctions);
+        
+        // Add current auction to the start of the list if not already there
+        if (!auctionIds.includes(id)) {
+          auctionIds.unshift(id);
+          
+          // Keep only the 5 most recent auctions
+          const updatedAuctions = auctionIds.slice(0, 5);
+          
+          // Save back to localStorage
+          localStorage.setItem('recentlyViewedAuctions', JSON.stringify(updatedAuctions));
+          console.log('LiveBidding: Stored auction ID in localStorage for farmer reference:', id);
+        }
+      } catch (e) {
+        console.error('LiveBidding: Error updating recently viewed auctions:', e);
+        // If error, just try to save this auction ID directly
+        localStorage.setItem('recentlyViewedAuctions', JSON.stringify([id]));
+      }
+
+      // Also explicitly store the current auction ID for easy access
+      localStorage.setItem('currentViewingAuctionId', id);
+    }
+  }, [id]);
+  
   // Join auction room and set up listeners
   useEffect(() => {
     if (!id) return;
