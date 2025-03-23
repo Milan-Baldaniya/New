@@ -1,41 +1,44 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { Leaf, Clock, ShoppingCart, Heart } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { useMarketplace } from "@/context/MarketplaceContext";
+import { useMarketplace, Product } from "@/context/MarketplaceContext";
 import { AnimatedButton } from "@/components/ui/animated-button";
 import { cn } from "@/lib/utils";
 import TiltCard from "@/components/ui/tilt-card";
-
-interface Product {
-  id: string;
-  name: string;
-  description: string;
-  price: number;
-  images: string[];
-  farmerId: string;
-  farmerName: string;
-  category: string;
-  quantity: number;
-  unit: string;
-  harvestDate: string;
-  organic: boolean;
-  bidding: boolean;
-  currentBid?: number;
-  endBidTime?: string;
-  startingBid?: number;
-}
 
 interface ProductCardProps {
   product: Product;
   index?: number;
 }
 
+// Define available fruit and vegetable images
+const PRODUCT_IMAGES = [
+  "https://images.unsplash.com/photo-1589927986089-35812388d1f4?q=80&w=300",
+  "https://images.unsplash.com/photo-1601493700625-9185417898cf?q=80&w=300",
+  "https://images.unsplash.com/photo-1519162808019-7de1683fa2ad?q=80&w=300",
+  "https://images.unsplash.com/photo-1439127989242-c3749a012eac?q=80&w=300",
+  "https://images.unsplash.com/photo-1447175008436-054170c2e979?q=80&w=300"
+];
+
+// Function to get a random product image
+const getRandomProductImage = () => {
+  const randomIndex = Math.floor(Math.random() * PRODUCT_IMAGES.length);
+  return PRODUCT_IMAGES[randomIndex];
+};
+
 const ProductCard: React.FC<ProductCardProps> = ({ product, index = 0 }) => {
   const { addToCart } = useMarketplace();
   const [isHovered, setIsHovered] = useState(false);
   const [isAddingToCart, setIsAddingToCart] = useState(false);
   const [isFavorite, setIsFavorite] = useState(false);
+  const [productImage, setProductImage] = useState<string>("");
+  
+  // Set a random product image only once when component mounts
+  useEffect(() => {
+    const randomImage = getRandomProductImage();
+    setProductImage(randomImage);
+  }, []);
   
   // Calculate staggered animation delay based on index
   const animationDelay = `${index * 0.1}s`;
@@ -142,11 +145,15 @@ const ProductCard: React.FC<ProductCardProps> = ({ product, index = 0 }) => {
           </div>
           
           <div className="relative h-48 overflow-hidden group">
-            <img 
-              src={product.images[0] || "/placeholder.svg"} 
-              alt={product.name}
-              className="w-full h-full object-cover transition-all duration-700 ease-in-out group-hover:scale-110"
-            />
+            {productImage ? (
+              <img 
+                src={productImage}
+                alt={product.name}
+                className="w-full h-full object-cover transition-all duration-700 ease-in-out group-hover:scale-110"
+              />
+            ) : (
+              <div className="w-full h-full bg-gray-200"></div>
+            )}
             
             {product.organic && (
               <Badge className="absolute top-2 left-2 bg-farm-green-500 z-10 animate-fade-in">
