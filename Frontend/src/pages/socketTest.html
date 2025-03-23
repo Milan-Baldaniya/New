@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Socket.io Connection Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            border: 1px solid #ccc;
+            padding: 20px;
+            border-radius: 5px;
+        }
+        .status {
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .connecting {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        .log {
+            height: 200px;
+            overflow-y: auto;
+            background-color: #f8f9fa;
+            padding: 10px;
+            border: 1px solid #ddd;
+            margin-bottom: 20px;
+            font-family: monospace;
+        }
+        button {
+            padding: 10px;
+            margin-right: 10px;
+            cursor: pointer;
+        }
+        input {
+            padding: 8px;
+            width: 300px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Socket.io Connection Test</h1>
+    
+    <div class="container">
+        <h2>Connection Status</h2>
+        <div id="status" class="status disconnected">Disconnected</div>
+        
+        <h2>Connection Settings</h2>
+        <div>
+            <label for="serverUrl">Server URL:</label>
+            <input type="text" id="serverUrl" value="http://localhost:5000" />
+            <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn">Disconnect</button>
+        </div>
+        
+        <h2>Test Messages</h2>
+        <div>
+            <input type="text" id="message" placeholder="Enter a test message" value="Hello from test client" />
+            <button id="sendBtn">Send Message</button>
+        </div>
+        
+        <h2>Event Log</h2>
+        <div id="log" class="log"></div>
+    </div>
+    
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script>
+        let socket;
+        const statusElement = document.getElementById('status');
+        const logElement = document.getElementById('log');
+        const serverUrlInput = document.getElementById('serverUrl');
+        const messageInput = document.getElementById('message');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const sendBtn = document.getElementById('sendBtn');
+        
+        // Log function
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = document.createElement('div');
+            logEntry.innerHTML = `<strong>${timestamp}</strong> [${type}] ${message}`;
+            
+            if (type === 'error') {
+                logEntry.style.color = 'red';
+            } else if (type === 'success') {
+                logEntry.style.color = 'green';
+            } else if (type === 'receive') {
+                logEntry.style.color = 'blue';
+            }
+            
+            logElement.appendChild(logEntry);
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+        
+        // Update status
+        function updateStatus(state) {
+            statusElement.className = 'status ' + state;
+            statusElement.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+        }
+        
+        // Connect function
+        function connect() {
+            const serverUrl = serverUrlInput.value.trim();
+            
+            if (!serverUrl) {
+                log('Please enter a server URL', 'error');
+                return;
+            }
+            
+            try {
+                updateStatus('connecting');
+                log(`Attempting to connect to ${serverUrl}...`);
+                
+                // Create socket connection
+                socket = io(serverUrl, {
+                    transports: ['websocket', 'polling'],
+                    reconnection: true
+                });
+                
+                // Connection events
+                socket.on('connect', () => {
+                    updateStatus('connected');
+                    log(`Connected successfully! Socket ID: ${socket.id}`, 'success');
+                });
+                
+                socket.on('connect_error', (error) => {
+                    updateStatus('disconnected');
+                    log(`Connection error: ${error.message}`, 'error');
+                });
+                
+                socket.on('disconnect', (reason) => {
+                    updateStatus('disconnected');
+                    log(`Disconnected: ${reason}`);
+                });
+                
+                // Test response events
+                socket.on('testResponse', (data) => {
+                    log(`Received response: ${JSON.stringify(data)}`, 'receive');
+                });
+                
+                socket.on('serverBroadcast', (data) => {
+                    log(`Broadcast received: ${JSON.stringify(data)}`, 'receive');
+                });
+                
+            } catch (error) {
+                updateStatus('disconnected');
+                log(`Error: ${error.message}`, 'error');
+            }
+        }
+        
+        // Disconnect function
+        function disconnect() {
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+                log('Manually disconnected');
+            }
+        }
+        
+        // Send message function
+        function sendMessage() {
+            if (!socket || !socket.connected) {
+                log('Not connected to server', 'error');
+                return;
+            }
+            
+            const message = messageInput.value.trim();
+            if (!message) {
+                log('Please enter a message', 'error');
+                return;
+            }
+            
+            log(`Sending message: ${message}`);
+            socket.emit('testMessage', { text: message, timestamp: new Date().toISOString() });
+        }
+        
+        // Event listeners
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        sendBtn.addEventListener('click', sendMessage);
+        
+        // Initialize
+        log('Socket.io Test Client ready. Click "Connect" to start.');
+    </script>
+</body>
+</html> 
